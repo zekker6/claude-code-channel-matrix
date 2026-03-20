@@ -2,6 +2,7 @@ import { describe, expect, test, beforeEach, afterEach } from 'bun:test'
 import { loadConfig, loadAccess, DEFAULT_MAX_IMAGE_SIZE, type Config, type Access } from './server'
 import { shouldForwardEvent, shouldAutoJoin, type SyncEvent, type SyncInvite, type TextEvent, type ImageEvent } from './server'
 import { downloadImage, scheduleImageCleanup, cleanupAllImages, trackedImages } from './server'
+import { loadThreadRoots, saveThreadRoot } from './server'
 import { existsSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
 
 describe('loadConfig', () => {
@@ -85,6 +86,76 @@ describe('loadConfig', () => {
   })
 })
 
+describe('loadConfig thread settings', () => {
+  const originalEnv = { ...process.env }
+
+  afterEach(() => {
+    process.env = { ...originalEnv }
+  })
+
+  const baseEnv = () => {
+    process.env.MATRIX_HOMESERVER_URL = 'https://matrix.example.com'
+    process.env.MATRIX_ACCESS_TOKEN = 'token'
+    process.env.MATRIX_BOT_USER_ID = '@bot:example.com'
+  }
+
+  test('returns null threadProject when MATRIX_THREADS is not set', () => {
+    baseEnv()
+    delete process.env.MATRIX_THREADS
+    delete process.env.MATRIX_ROOM_IDS
+
+    const config = loadConfig('/tmp/no-such-dir')
+    expect(config.threadProject).toBeNull()
+  })
+
+  test('auto-detects threadProject from cwd basename when MATRIX_THREADS=true', () => {
+    baseEnv()
+    process.env.MATRIX_THREADS = 'true'
+    process.env.MATRIX_ROOM_IDS = '!room1:example.com'
+    delete process.env.MATRIX_THREAD_PROJECT
+
+    const config = loadConfig('/tmp/no-such-dir')
+    expect(config.threadProject).toBe(require('node:path').basename(process.cwd()))
+  })
+
+  test('uses MATRIX_THREAD_PROJECT override when set', () => {
+    baseEnv()
+    process.env.MATRIX_THREADS = 'true'
+    process.env.MATRIX_ROOM_IDS = '!room1:example.com'
+    process.env.MATRIX_THREAD_PROJECT = 'my-custom-project'
+
+    const config = loadConfig('/tmp/no-such-dir')
+    expect(config.threadProject).toBe('my-custom-project')
+  })
+
+  test('ignores MATRIX_THREAD_PROJECT when MATRIX_THREADS is not true', () => {
+    baseEnv()
+    delete process.env.MATRIX_THREADS
+    process.env.MATRIX_THREAD_PROJECT = 'my-custom-project'
+
+    const config = loadConfig('/tmp/no-such-dir')
+    expect(config.threadProject).toBeNull()
+  })
+
+  test('allows MATRIX_THREADS=true without MATRIX_ROOM_IDS', () => {
+    baseEnv()
+    process.env.MATRIX_THREADS = 'true'
+    delete process.env.MATRIX_ROOM_IDS
+
+    const config = loadConfig('/tmp/no-such-dir')
+    expect(config.threadProject).toBeTruthy()
+    expect(config.roomIds).toBeNull()
+  })
+
+  test('accepts MATRIX_THREADS=true when MATRIX_ROOM_IDS is set', () => {
+    baseEnv()
+    process.env.MATRIX_THREADS = 'true'
+    process.env.MATRIX_ROOM_IDS = '!room1:example.com'
+
+    expect(() => loadConfig('/tmp/no-such-dir')).not.toThrow()
+  })
+})
+
 describe('loadAccess', () => {
   test('returns defaults when file does not exist', () => {
     const access = loadAccess('/tmp/nonexistent-access.json')
@@ -148,6 +219,7 @@ import {
   parseSyncInvites,
   buildMessageBody,
   buildReactionBody,
+  buildThreadRootBody,
   nextTxnId,
   roomNameCache,
   sanitizeForFilename,
@@ -474,12 +546,49 @@ describe('buildMessageBody', () => {
   })
 })
 
+describe('buildMessageBody with threads', () => {
+  test('includes m.relates_to when threadRootId is provided', () => {
+    const body = buildMessageBody('hello', undefined, '$root1')
+    expect(body['m.relates_to']).toEqual({
+      rel_type: 'm.thread',
+      event_id: '$root1',
+      is_falling_back: true,
+      'm.in_reply_to': { event_id: '$root1' },
+    })
+  })
+
+  test('omits m.relates_to when threadRootId is undefined', () => {
+    const body = buildMessageBody('hello', undefined)
+    expect(body['m.relates_to']).toBeUndefined()
+  })
+
+  test('includes both HTML and thread info', () => {
+    const body = buildMessageBody('hello', '<b>hello</b>', '$root1')
+    expect(body.format).toBe('org.matrix.custom.html')
+    expect(body.formatted_body).toBe('<b>hello</b>')
+    expect(body['m.relates_to']).toEqual({
+      rel_type: 'm.thread',
+      event_id: '$root1',
+      is_falling_back: true,
+      'm.in_reply_to': { event_id: '$root1' },
+    })
+  })
+})
+
 describe('buildReactionBody', () => {
   test('builds m.reaction content', () => {
     const body = buildReactionBody('$evt1', '👍')
     expect(body['m.relates_to'].rel_type).toBe('m.annotation')
     expect(body['m.relates_to'].event_id).toBe('$evt1')
     expect(body['m.relates_to'].key).toBe('👍')
+  })
+})
+
+describe('buildThreadRootBody', () => {
+  test('creates a descriptive thread root message', () => {
+    const body = buildThreadRootBody('my-project')
+    expect(body.msgtype).toBe('m.notice')
+    expect(body.body).toContain('my-project')
   })
 })
 
@@ -591,7 +700,7 @@ describe('shouldForwardEvent', () => {
     const event: SyncEvent = {
       type: 'text',
       roomId: '!r:x', roomName: 'General',
-      sender: '@alice:example.com', eventId: '$1', body: 'hi',
+      sender: '@alice:example.com', eventId: '$1', threadRootId: null, body: 'hi',
     }
     expect(shouldForwardEvent(event, access, botUserId)).toBe(true)
   })
@@ -600,7 +709,7 @@ describe('shouldForwardEvent', () => {
     const event: SyncEvent = {
       type: 'text',
       roomId: '!r:x', roomName: 'General',
-      sender: '@mallory:example.com', eventId: '$1', body: 'hi',
+      sender: '@mallory:example.com', eventId: '$1', threadRootId: null, body: 'hi',
     }
     expect(shouldForwardEvent(event, access, botUserId)).toBe(false)
   })
@@ -609,7 +718,7 @@ describe('shouldForwardEvent', () => {
     const event: SyncEvent = {
       type: 'text',
       roomId: '!r:x', roomName: 'General',
-      sender: '@bot:example.com', eventId: '$1', body: 'hi',
+      sender: '@bot:example.com', eventId: '$1', threadRootId: null, body: 'hi',
     }
     expect(shouldForwardEvent(event, access, botUserId)).toBe(false)
   })
@@ -619,7 +728,7 @@ describe('shouldForwardEvent', () => {
     const event: SyncEvent = {
       type: 'text',
       roomId: '!r:x', roomName: 'General',
-      sender: '@alice:example.com', eventId: '$1', body: 'hi',
+      sender: '@alice:example.com', eventId: '$1', threadRootId: null, body: 'hi',
     }
     expect(shouldForwardEvent(event, emptyAccess, botUserId)).toBe(false)
   })
@@ -628,7 +737,7 @@ describe('shouldForwardEvent', () => {
     const event: SyncEvent = {
       type: 'text',
       roomId: '!room1:x', roomName: 'General',
-      sender: '@alice:example.com', eventId: '$1', body: 'hi',
+      sender: '@alice:example.com', eventId: '$1', threadRootId: null, body: 'hi',
     }
     expect(shouldForwardEvent(event, access, botUserId, ['!room1:x', '!room2:x'])).toBe(true)
   })
@@ -637,7 +746,7 @@ describe('shouldForwardEvent', () => {
     const event: SyncEvent = {
       type: 'text',
       roomId: '!other:x', roomName: 'Random',
-      sender: '@alice:example.com', eventId: '$1', body: 'hi',
+      sender: '@alice:example.com', eventId: '$1', threadRootId: null, body: 'hi',
     }
     expect(shouldForwardEvent(event, access, botUserId, ['!room1:x'])).toBe(false)
   })
@@ -646,9 +755,36 @@ describe('shouldForwardEvent', () => {
     const event: SyncEvent = {
       type: 'text',
       roomId: '!any:x', roomName: 'Whatever',
-      sender: '@alice:example.com', eventId: '$1', body: 'hi',
+      sender: '@alice:example.com', eventId: '$1', threadRootId: null, body: 'hi',
     }
     expect(shouldForwardEvent(event, access, botUserId, null)).toBe(true)
+  })
+})
+
+describe('shouldForwardEvent with threaded messages', () => {
+  const access: Access = {
+    allowedUsers: ['@alice:example.com'],
+    ackReaction: null,
+    maxImageSize: DEFAULT_MAX_IMAGE_SIZE,
+  }
+  const botUserId = '@bot:example.com'
+
+  test('forwards threaded messages (thread filtering is handled by sync loop)', () => {
+    const event: SyncEvent = {
+      type: 'text',
+      roomId: '!r:x', roomName: 'General',
+      sender: '@alice:example.com', eventId: '$1', threadRootId: '$root1', body: 'hi',
+    }
+    expect(shouldForwardEvent(event, access, botUserId)).toBe(true)
+  })
+
+  test('forwards non-threaded messages from allowed users', () => {
+    const event: SyncEvent = {
+      type: 'text',
+      roomId: '!r:x', roomName: 'General',
+      sender: '@alice:example.com', eventId: '$1', threadRootId: null, body: 'hi',
+    }
+    expect(shouldForwardEvent(event, access, botUserId)).toBe(true)
   })
 })
 
@@ -686,6 +822,7 @@ describe('downloadImage', () => {
     accessToken: 'test-token',
     botUserId: '@bot:example.com',
     roomIds: null,
+    threadProject: null,
   }
   const access: Access = {
     allowedUsers: [],
@@ -698,6 +835,7 @@ describe('downloadImage', () => {
     roomName: 'General',
     sender: '@alice:x',
     eventId: '$test-img-evt',
+    threadRootId: null,
     body: 'photo.png',
     mxcUrl: 'mxc://example.com/abc123',
     mimeType: 'image/png',
@@ -831,6 +969,132 @@ describe('scheduleImageCleanup', () => {
     scheduleImageCleanup(testFile, 50)
     await new Promise((r) => setTimeout(r, 100))
     expect(trackedImages.has(testFile)).toBe(false)
+  })
+})
+
+describe('thread root persistence', () => {
+  const testDir = '/tmp/test-matrix-threads'
+  const threadsFile = `${testDir}/threads.json`
+
+  afterEach(() => {
+    if (existsSync(testDir)) rmSync(testDir, { recursive: true })
+  })
+
+  test('returns empty map when threads.json does not exist', () => {
+    const map = loadThreadRoots(threadsFile)
+    expect(map.size).toBe(0)
+  })
+
+  test('saves and loads thread root for room+project', () => {
+    saveThreadRoot(threadsFile, '!room:x', 'my-project', '$evt1')
+    const map = loadThreadRoots(threadsFile)
+    expect(map.get('!room:x:my-project')).toBe('$evt1')
+  })
+
+  test('preserves existing entries when saving new one', () => {
+    saveThreadRoot(threadsFile, '!room:x', 'project-a', '$evt1')
+    saveThreadRoot(threadsFile, '!room:x', 'project-b', '$evt2')
+    const map = loadThreadRoots(threadsFile)
+    expect(map.get('!room:x:project-a')).toBe('$evt1')
+    expect(map.get('!room:x:project-b')).toBe('$evt2')
+  })
+
+  test('overwrites existing entry for same room+project', () => {
+    saveThreadRoot(threadsFile, '!room:x', 'my-project', '$evt1')
+    saveThreadRoot(threadsFile, '!room:x', 'my-project', '$evt2')
+    const map = loadThreadRoots(threadsFile)
+    expect(map.get('!room:x:my-project')).toBe('$evt2')
+    expect(map.size).toBe(1)
+  })
+
+  test('returns empty map on malformed JSON', () => {
+    mkdirSync(testDir, { recursive: true })
+    writeFileSync(threadsFile, '{broken')
+    const map = loadThreadRoots(threadsFile)
+    expect(map.size).toBe(0)
+  })
+})
+
+describe('parseSyncEvents thread support', () => {
+  test('extracts threadRootId from threaded message', () => {
+    const syncResponse = {
+      rooms: {
+        join: {
+          '!r:x': {
+            timeline: {
+              events: [{
+                type: 'm.room.message',
+                sender: '@a:x',
+                event_id: '$msg1',
+                content: {
+                  msgtype: 'm.text',
+                  body: 'reply in thread',
+                  'm.relates_to': { rel_type: 'm.thread', event_id: '$root1' },
+                },
+              }],
+            },
+            state: { events: [] },
+          },
+        },
+      },
+    }
+    const events = parseSyncEvents(syncResponse)
+    expect(events).toHaveLength(1)
+    expect(events[0].threadRootId).toBe('$root1')
+  })
+
+  test('sets threadRootId to null for non-threaded messages', () => {
+    const syncResponse = {
+      rooms: {
+        join: {
+          '!r:x': {
+            timeline: {
+              events: [{
+                type: 'm.room.message',
+                sender: '@a:x',
+                event_id: '$msg1',
+                content: { msgtype: 'm.text', body: 'plain message' },
+              }],
+            },
+            state: { events: [] },
+          },
+        },
+      },
+    }
+    const events = parseSyncEvents(syncResponse)
+    expect(events).toHaveLength(1)
+    expect(events[0].threadRootId).toBeNull()
+  })
+
+  test('extracts threadRootId from threaded image message', () => {
+    const syncResponse = {
+      rooms: {
+        join: {
+          '!r:x': {
+            timeline: {
+              events: [{
+                type: 'm.room.message',
+                sender: '@a:x',
+                event_id: '$msg1',
+                content: {
+                  msgtype: 'm.image',
+                  body: 'photo.jpg',
+                  url: 'mxc://example.com/abc123',
+                  filename: 'photo.jpg',
+                  info: { mimetype: 'image/jpeg', size: 12345 },
+                  'm.relates_to': { rel_type: 'm.thread', event_id: '$root1' },
+                },
+              }],
+            },
+            state: { events: [] },
+          },
+        },
+      },
+    }
+    const events = parseSyncEvents(syncResponse)
+    expect(events).toHaveLength(1)
+    expect(events[0].type).toBe('image')
+    expect(events[0].threadRootId).toBe('$root1')
   })
 })
 

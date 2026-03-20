@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { existsSync, readFileSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -17,6 +17,7 @@ export interface Config {
   accessToken: string
   botUserId: string
   roomIds: string[] | null
+  threadProject: string | null
 }
 
 export interface Access {
@@ -73,11 +74,17 @@ export function loadConfig(envDir?: string): Config {
   const rawRoomIds = process.env.MATRIX_ROOM_IDS?.trim()
   const roomIds = rawRoomIds ? rawRoomIds.split(',').map((id) => id.trim()).filter(Boolean) : null
 
+  const threadsEnabled = process.env.MATRIX_THREADS === 'true'
+  const threadProject = threadsEnabled
+    ? (process.env.MATRIX_THREAD_PROJECT || basename(process.cwd()))
+    : null
+
   return {
     homeserverUrl,
     accessToken: requireEnv('MATRIX_ACCESS_TOKEN'),
     botUserId: requireEnv('MATRIX_BOT_USER_ID'),
     roomIds,
+    threadProject,
   }
 }
 
@@ -101,6 +108,38 @@ export function loadAccess(path?: string): Access {
   }
 }
 
+// ── Thread Root Persistence ──────────────────────────────
+
+/** Thread roots are stored as { "roomId:project": "$eventId" }. */
+function threadKey(roomId: string, project: string): string {
+  return `${roomId}:${project}`
+}
+
+export function loadThreadRoots(path?: string): Map<string, string> {
+  const filePath = path ?? join(CHANNELS_DIR, 'threads.json')
+  if (!existsSync(filePath)) return new Map()
+  try {
+    const raw = JSON.parse(readFileSync(filePath, 'utf-8'))
+    return new Map(Object.entries(raw))
+  } catch {
+    return new Map()
+  }
+}
+
+export function saveThreadRoot(
+  pathOrUndefined: string | undefined,
+  roomId: string,
+  project: string,
+  eventId: string,
+): void {
+  const filePath = pathOrUndefined ?? join(CHANNELS_DIR, 'threads.json')
+  const dir = filePath.substring(0, filePath.lastIndexOf('/'))
+  mkdirSync(dir, { recursive: true })
+  const existing = loadThreadRoots(filePath)
+  existing.set(threadKey(roomId, project), eventId)
+  writeFileSync(filePath, JSON.stringify(Object.fromEntries(existing), null, 2))
+}
+
 // ── Matrix CS API Helpers ──────────────────────────────
 
 const SYNC_FILTER = JSON.stringify({
@@ -117,6 +156,7 @@ export interface BaseEvent {
   roomName: string
   sender: string
   eventId: string
+  threadRootId: string | null
 }
 
 export interface TextEvent extends BaseEvent {
@@ -176,6 +216,9 @@ export function parseSyncEvents(data: any): SyncEvent[] {
     for (const event of room.timeline?.events ?? []) {
       if (event.type !== 'm.room.message') continue
 
+      const relatesTo = event.content?.['m.relates_to']
+      const threadRootId = relatesTo?.rel_type === 'm.thread' ? relatesTo.event_id : null
+
       const msgtype = event.content?.msgtype
       if (msgtype === 'm.text') {
         events.push({
@@ -184,6 +227,7 @@ export function parseSyncEvents(data: any): SyncEvent[] {
           roomName,
           sender: event.sender,
           eventId: event.event_id,
+          threadRootId,
           body: event.content.body,
         })
       } else if (msgtype === 'm.image') {
@@ -196,6 +240,7 @@ export function parseSyncEvents(data: any): SyncEvent[] {
               roomName,
               sender: event.sender,
               eventId: event.event_id,
+              threadRootId,
               body: `[Encrypted image not supported: ${event.content.body ?? 'image'}] This room uses E2EE — the plugin cannot decrypt media.`,
             })
           }
@@ -207,6 +252,7 @@ export function parseSyncEvents(data: any): SyncEvent[] {
           roomName,
           sender: event.sender,
           eventId: event.event_id,
+          threadRootId,
           body: event.content.body ?? event.content.filename ?? 'image',
           mxcUrl: event.content.url,
           mimeType: event.content.info?.mimetype ?? 'application/octet-stream',
@@ -240,11 +286,20 @@ export function parseSyncInvites(data: any): SyncInvite[] {
 export function buildMessageBody(
   text: string,
   html: string | undefined,
-): Record<string, string> {
-  const body: Record<string, string> = { msgtype: 'm.notice', body: text }
+  threadRootId?: string,
+): Record<string, any> {
+  const body: Record<string, any> = { msgtype: 'm.notice', body: text }
   if (html) {
     body.format = 'org.matrix.custom.html'
     body.formatted_body = html
+  }
+  if (threadRootId) {
+    body['m.relates_to'] = {
+      rel_type: 'm.thread',
+      event_id: threadRootId,
+      is_falling_back: true,
+      'm.in_reply_to': { event_id: threadRootId },
+    }
   }
   return body
 }
@@ -256,6 +311,15 @@ export function buildReactionBody(eventId: string, emoji: string) {
       event_id: eventId,
       key: emoji,
     },
+  }
+}
+
+export function buildThreadRootBody(project: string): Record<string, any> {
+  return {
+    msgtype: 'm.notice',
+    body: `Thread: ${project}`,
+    format: 'org.matrix.custom.html',
+    formatted_body: `<b>Thread:</b> ${project}`,
   }
 }
 
@@ -501,8 +565,9 @@ async function matrixReply(
   roomId: string,
   text: string,
   html?: string,
+  threadRootId?: string,
 ): Promise<string> {
-  return matrixSend(config, roomId, 'm.room.message', buildMessageBody(text, html))
+  return matrixSend(config, roomId, 'm.room.message', buildMessageBody(text, html, threadRootId))
 }
 
 async function matrixReact(
@@ -514,11 +579,33 @@ async function matrixReact(
   return matrixSend(config, roomId, 'm.reaction', buildReactionBody(eventId, emoji))
 }
 
+async function ensureThreadRoot(
+  config: Config,
+  roomId: string,
+  project: string,
+  threadsPath?: string,
+): Promise<string> {
+  const roots = loadThreadRoots(threadsPath)
+  const key = `${roomId}:${project}`
+  const existing = roots.get(key)
+  if (existing) return existing
+
+  const eventId = await matrixSend(
+    config,
+    roomId,
+    'm.room.message',
+    buildThreadRootBody(project),
+  )
+  saveThreadRoot(threadsPath, roomId, project, eventId)
+  console.error(`Created thread root for "${project}" in ${roomId}: ${eventId}`)
+  return eventId
+}
+
 // ── MCP Server ─────────────────────────────────────────
 
-function createMcpServer(config: Config): Server {
+function createMcpServer(config: Config, threadRootByRoom: Map<string, string>): Server {
   const mcp = new Server(
-    { name: 'matrix', version: '0.3.1' },
+    { name: 'matrix', version: '0.4.0' },
     {
       capabilities: {
         experimental: { 'claude/channel': {} },
@@ -527,7 +614,8 @@ function createMcpServer(config: Config): Server {
       instructions:
         'Messages arrive as <channel source="matrix" room_id="!abc:domain" room_name="General" sender="@user:domain" event_id="$evt:domain">. ' +
         'Reply with the reply tool (pass room_id). React with the react tool (pass room_id, event_id, emoji). ' +
-        'When a message contains an image file path, use the Read tool to view it before responding.',
+        'When a message contains an image file path, use the Read tool to view it before responding. ' +
+        'Threading is handled automatically — replies are routed to the correct thread.',
     },
   )
 
@@ -570,7 +658,8 @@ function createMcpServer(config: Config): Server {
         if (!args.room_id || !args.text) {
           return { content: [{ type: 'text', text: 'Missing required arguments: room_id and text' }], isError: true }
         }
-        await matrixReply(config, args.room_id, args.text, args.html)
+        const threadRootId = threadRootByRoom.get(args.room_id)
+        await matrixReply(config, args.room_id, args.text, args.html, threadRootId)
         return { content: [{ type: 'text', text: 'sent' }] }
       }
       case 'react': {
@@ -618,6 +707,7 @@ async function runSyncLoop(
   config: Config,
   access: Access,
   mcp: Server,
+  threadRootByRoom: Map<string, string>,
 ): Promise<never> {
   let since: string | null = null
   let backoffMs = 5000
@@ -644,6 +734,21 @@ async function runSyncLoop(
     throw err
   }
 
+  // Pre-load persisted thread roots when threading is enabled
+  if (config.threadProject) {
+    const roots = loadThreadRoots()
+    for (const [key, eventId] of roots) {
+      // Keys are "roomId:project" — only load roots for our project
+      if (key.endsWith(`:${config.threadProject}`)) {
+        const roomId = key.slice(0, key.length - config.threadProject.length - 1)
+        threadRootByRoom.set(roomId, eventId)
+      }
+    }
+    if (threadRootByRoom.size > 0) {
+      console.error(`Loaded ${threadRootByRoom.size} persisted thread root(s) for "${config.threadProject}"`)
+    }
+  }
+
   // Incremental sync loop
   while (true) {
     try {
@@ -667,12 +772,35 @@ async function runSyncLoop(
       for (const event of events) {
         if (!shouldForwardEvent(event, access, config.botUserId, config.roomIds)) continue
 
+        // Thread routing: when threads are enabled, filter and lazily create roots
+        if (config.threadProject) {
+          if (event.threadRootId) {
+            // Threaded message — only accept if it's in our project's thread
+            const ourRoot = threadRootByRoom.get(event.roomId)
+            if (event.threadRootId !== ourRoot) continue
+          } else {
+            // Non-threaded message — always drop, but create thread root if needed
+            if (!threadRootByRoom.has(event.roomId)) {
+              try {
+                const rootId = await ensureThreadRoot(config, event.roomId, config.threadProject)
+                threadRootByRoom.set(event.roomId, rootId)
+              } catch (err) {
+                console.error(`Failed to create thread root in ${event.roomId}:`, err)
+              }
+            }
+            continue
+          }
+        }
+
         let content: string
         const meta: Record<string, string> = {
           room_id: event.roomId,
           room_name: event.roomName,
           sender: event.sender,
           event_id: event.eventId,
+        }
+        if (config.threadProject) {
+          meta.thread_project = config.threadProject
         }
 
         if (event.type === 'text') {
@@ -721,6 +849,9 @@ if (import.meta.main) {
   const config = loadConfig()
   const access = loadAccess()
 
+  // Shared mutable map — populated by runSyncLoop, read by MCP reply handler
+  const threadRootByRoom = new Map<string, string>()
+
   // Clean up downloaded images on exit
   process.on('SIGINT', () => { cleanupAllImages(); process.exit(0) })
   process.on('SIGTERM', () => { cleanupAllImages(); process.exit(0) })
@@ -730,11 +861,14 @@ if (import.meta.main) {
   console.error(`Homeserver: ${config.homeserverUrl}`)
   console.error(`Allowed users: ${access.allowedUsers.join(', ') || '(none)'}`)
   console.error(`Room filter: ${config.roomIds ? config.roomIds.join(', ') : '(all rooms)'}`)
+  if (config.threadProject) {
+    console.error(`Threading enabled for project: ${config.threadProject}`)
+  }
 
-  const mcp = createMcpServer(config)
+  const mcp = createMcpServer(config, threadRootByRoom)
   await mcp.connect(new StdioServerTransport())
 
-  runSyncLoop(config, access, mcp).catch((err) => {
+  runSyncLoop(config, access, mcp, threadRootByRoom).catch((err) => {
     console.error('Fatal sync loop error:', err)
     process.exit(1)
   })
