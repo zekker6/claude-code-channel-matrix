@@ -16,6 +16,7 @@ export interface Config {
   homeserverUrl: string
   accessToken: string
   botUserId: string
+  roomIds: string[] | null
 }
 
 export interface Access {
@@ -59,10 +60,14 @@ export function loadConfig(envDir?: string): Config {
     homeserverUrl = `https://${homeserverUrl}`
   }
 
+  const rawRoomIds = process.env.MATRIX_ROOM_IDS?.trim()
+  const roomIds = rawRoomIds ? rawRoomIds.split(',').map((id) => id.trim()).filter(Boolean) : null
+
   return {
     homeserverUrl,
     accessToken: requireEnv('MATRIX_ACCESS_TOKEN'),
     botUserId: requireEnv('MATRIX_BOT_USER_ID'),
+    roomIds,
   }
 }
 
@@ -359,16 +364,22 @@ export function shouldForwardEvent(
   event: SyncEvent,
   access: Access,
   botUserId: string,
+  roomIds: string[] | null = null,
 ): boolean {
   if (event.sender === botUserId) return false
-  return access.allowedUsers.includes(event.sender)
+  if (!access.allowedUsers.includes(event.sender)) return false
+  if (roomIds && !roomIds.includes(event.roomId)) return false
+  return true
 }
 
 export function shouldAutoJoin(
   invite: SyncInvite,
   access: Access,
+  roomIds: string[] | null = null,
 ): boolean {
-  return access.allowedUsers.includes(invite.inviter)
+  if (!access.allowedUsers.includes(invite.inviter)) return false
+  if (roomIds && !roomIds.includes(invite.roomId)) return false
+  return true
 }
 
 // ── Sync Loop ──────────────────────────────────────────
@@ -391,7 +402,7 @@ async function runSyncLoop(
     // Process any pending invites from before the plugin started
     const pendingInvites = parseSyncInvites(data)
     for (const invite of pendingInvites) {
-      if (shouldAutoJoin(invite, access)) {
+      if (shouldAutoJoin(invite, access, config.roomIds)) {
         console.error(`Auto-joining room ${invite.roomId} (pending invite from ${invite.inviter})`)
         matrixJoin(config, invite.roomId).catch((err) =>
           console.error(`Failed to join ${invite.roomId}:`, err)
@@ -411,7 +422,7 @@ async function runSyncLoop(
       // Process invites
       const invites = parseSyncInvites(data)
       for (const invite of invites) {
-        if (shouldAutoJoin(invite, access)) {
+        if (shouldAutoJoin(invite, access, config.roomIds)) {
           console.error(`Auto-joining room ${invite.roomId} (invited by ${invite.inviter})`)
           matrixJoin(config, invite.roomId).catch((err) =>
             console.error(`Failed to join ${invite.roomId}:`, err)
@@ -424,7 +435,7 @@ async function runSyncLoop(
       // Process messages
       const events = parseSyncEvents(data)
       for (const event of events) {
-        if (!shouldForwardEvent(event, access, config.botUserId)) continue
+        if (!shouldForwardEvent(event, access, config.botUserId, config.roomIds)) continue
 
         // Forward to Claude
         await mcp.notification({
@@ -468,6 +479,7 @@ if (import.meta.main) {
   console.error(`Matrix channel starting for ${config.botUserId}`)
   console.error(`Homeserver: ${config.homeserverUrl}`)
   console.error(`Allowed users: ${access.allowedUsers.join(', ') || '(none)'}`)
+  console.error(`Room filter: ${config.roomIds ? config.roomIds.join(', ') : '(all rooms)'}`)
 
   const mcp = createMcpServer(config)
   await mcp.connect(new StdioServerTransport())

@@ -61,6 +61,26 @@ describe('loadConfig', () => {
 
     expect(() => loadConfig('/tmp/no-such-dir')).toThrow('MATRIX_BOT_USER_ID')
   })
+
+  test('parses MATRIX_ROOM_IDS as comma-separated list', () => {
+    process.env.MATRIX_HOMESERVER_URL = 'https://matrix.example.com'
+    process.env.MATRIX_ACCESS_TOKEN = 'token'
+    process.env.MATRIX_BOT_USER_ID = '@bot:example.com'
+    process.env.MATRIX_ROOM_IDS = '!room1:example.com, !room2:example.com'
+
+    const config = loadConfig('/tmp/no-such-dir')
+    expect(config.roomIds).toEqual(['!room1:example.com', '!room2:example.com'])
+  })
+
+  test('returns null roomIds when MATRIX_ROOM_IDS is not set', () => {
+    process.env.MATRIX_HOMESERVER_URL = 'https://matrix.example.com'
+    process.env.MATRIX_ACCESS_TOKEN = 'token'
+    process.env.MATRIX_BOT_USER_ID = '@bot:example.com'
+    delete process.env.MATRIX_ROOM_IDS
+
+    const config = loadConfig('/tmp/no-such-dir')
+    expect(config.roomIds).toBeNull()
+  })
 })
 
 describe('loadAccess', () => {
@@ -337,6 +357,30 @@ describe('shouldForwardEvent', () => {
     }
     expect(shouldForwardEvent(event, emptyAccess, botUserId)).toBe(false)
   })
+
+  test('forwards events from allowed rooms when roomIds is set', () => {
+    const event: SyncEvent = {
+      roomId: '!room1:x', roomName: 'General',
+      sender: '@alice:example.com', eventId: '$1', body: 'hi',
+    }
+    expect(shouldForwardEvent(event, access, botUserId, ['!room1:x', '!room2:x'])).toBe(true)
+  })
+
+  test('drops events from rooms not in roomIds filter', () => {
+    const event: SyncEvent = {
+      roomId: '!other:x', roomName: 'Random',
+      sender: '@alice:example.com', eventId: '$1', body: 'hi',
+    }
+    expect(shouldForwardEvent(event, access, botUserId, ['!room1:x'])).toBe(false)
+  })
+
+  test('forwards all rooms when roomIds is null', () => {
+    const event: SyncEvent = {
+      roomId: '!any:x', roomName: 'Whatever',
+      sender: '@alice:example.com', eventId: '$1', body: 'hi',
+    }
+    expect(shouldForwardEvent(event, access, botUserId, null)).toBe(true)
+  })
 })
 
 describe('shouldAutoJoin', () => {
@@ -351,5 +395,17 @@ describe('shouldAutoJoin', () => {
 
   test('ignores when inviter is not in allowedUsers', () => {
     expect(shouldAutoJoin({ roomId: '!r:x', inviter: '@mallory:example.com' }, access)).toBe(false)
+  })
+
+  test('joins when room is in roomIds filter', () => {
+    expect(shouldAutoJoin({ roomId: '!r:x', inviter: '@alice:example.com' }, access, ['!r:x'])).toBe(true)
+  })
+
+  test('ignores when room is not in roomIds filter', () => {
+    expect(shouldAutoJoin({ roomId: '!other:x', inviter: '@alice:example.com' }, access, ['!r:x'])).toBe(false)
+  })
+
+  test('joins any room when roomIds is null', () => {
+    expect(shouldAutoJoin({ roomId: '!any:x', inviter: '@alice:example.com' }, access, null)).toBe(true)
   })
 })

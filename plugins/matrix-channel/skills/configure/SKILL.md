@@ -39,6 +39,18 @@ If arguments are missing, ask the user to provide them:
    MATRIX_BOT_USER_ID=<bot_user_id>
    ```
 
-4. Confirm the configuration was saved.
+5. Confirm the configuration was saved.
 
-5. Remind the user to set up their allowlist with `/matrix:access add <user_id>` if they haven't already.
+6. Remind the user to set up their allowlist with `/matrix:access add <user_id>` if they haven't already.
+
+## Per-project room filtering
+
+To restrict a Claude Code project to specific Matrix rooms, set `MATRIX_ROOM_IDS` in the project's `.claude/settings.local.json` or in the `.env` file:
+
+```
+MATRIX_ROOM_IDS=!roomA:example.com,!roomB:example.com
+```
+
+- Comma-separated list of Matrix room IDs.
+- When set, only messages from those rooms are forwarded to Claude, and the bot will only auto-join those rooms on invite.
+- When unset, all rooms are forwarded (default behavior).
