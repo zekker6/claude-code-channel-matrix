@@ -38,7 +38,7 @@ Channel plugins that are not on the official approved allowlist require the `--d
 claude --dangerously-load-development-channels plugin:matrix@claude-code-channel-matrix
 ```
 
-This applies to all self-published and local channel plugins. To remove this requirement, [submit the plugin to the official marketplace](https://code.claude.com/docs/en/channels-reference#package-as-a-plugin) for security review.
+> The plugin was submitted to official marketplace to review, instruction will be updated if it will be approved.
 
 ## Configuration
 
