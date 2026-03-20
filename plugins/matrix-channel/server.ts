@@ -27,7 +27,7 @@ export interface Access {
 
 // ── Config ─────────────────────────────────────────────
 
-const CHANNELS_DIR = join(homedir(), '.claude', 'channels', 'matrix')
+const CHANNELS_DIR = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'channels', 'matrix')
 export const DEFAULT_MAX_IMAGE_SIZE = 10 * 1024 * 1024 // 10 MB
 
 function requireEnv(name: string): string {
