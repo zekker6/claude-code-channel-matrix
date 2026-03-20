@@ -1,0 +1,16 @@
+{
+  "name": "claude-code-channel-matrix",
+  "owner": {
+    "name": "zekker6"
+  },
+  "metadata": {
+    "description": "Matrix channel plugin for Claude Code"
+  },
+  "plugins": [
+    {
+      "name": "matrix",
+      "source": "./plugins/matrix-channel",
+      "description": "Two-way Matrix channel for Claude Code via the Matrix CS API"
+    }
+  ]
+}

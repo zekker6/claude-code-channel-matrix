@@ -1,0 +1,13 @@
+{
+  "name": "claude-code-channel-matrix",
+  "version": "0.1.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zekker6/claude-code-channel-matrix.git"
+  },
+  "author": "zekker6",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}

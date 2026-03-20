@@ -1,0 +1,11 @@
+{
+  "name": "matrix",
+  "description": "Two-way Matrix channel for Claude Code via the Matrix CS API",
+  "version": "0.1.0",
+  "author": {
+    "name": "zekker6"
+  },
+  "homepage": "https://github.com/zekker6/claude-code-channel-matrix",
+  "repository": "https://github.com/zekker6/claude-code-channel-matrix",
+  "license": "MIT"
+}
