@@ -518,7 +518,7 @@ async function matrixReact(
 
 function createMcpServer(config: Config): Server {
   const mcp = new Server(
-    { name: 'matrix', version: '0.3.0' },
+    { name: 'matrix', version: '0.3.1' },
     {
       capabilities: {
         experimental: { 'claude/channel': {} },
