@@ -1,6 +1,8 @@
 import { describe, expect, test, beforeEach, afterEach } from 'bun:test'
-import { loadConfig, loadAccess, type Config, type Access } from './server'
-import { shouldForwardEvent, shouldAutoJoin, type SyncEvent, type SyncInvite } from './server'
+import { loadConfig, loadAccess, DEFAULT_MAX_IMAGE_SIZE, type Config, type Access } from './server'
+import { shouldForwardEvent, shouldAutoJoin, type SyncEvent, type SyncInvite, type TextEvent, type ImageEvent } from './server'
+import { downloadImage, scheduleImageCleanup, cleanupAllImages, trackedImages } from './server'
+import { existsSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
 
 describe('loadConfig', () => {
   const originalEnv = { ...process.env }
@@ -110,6 +112,34 @@ describe('loadAccess', () => {
     expect(access.allowedUsers).toEqual(['@alice:example.com'])
     expect(access.ackReaction).toBe('👀')
   })
+
+  test('loads maxImageSize from JSON file', async () => {
+    const path = '/tmp/test-access-imgsize.json'
+    await Bun.write(path, JSON.stringify({
+      allowedUsers: ['@alice:example.com'],
+      ackReaction: '👀',
+      maxImageSize: 5242880,
+    }))
+
+    const access = loadAccess(path)
+    expect(access.maxImageSize).toBe(5242880)
+  })
+
+  test('defaults maxImageSize to 10MB when absent', () => {
+    const access = loadAccess('/tmp/nonexistent-access.json')
+    expect(access.maxImageSize).toBe(DEFAULT_MAX_IMAGE_SIZE)
+  })
+
+  test('defaults maxImageSize when value is not a number', async () => {
+    const path = '/tmp/test-access-badsize.json'
+    await Bun.write(path, JSON.stringify({
+      allowedUsers: [],
+      maxImageSize: 'big',
+    }))
+
+    const access = loadAccess(path)
+    expect(access.maxImageSize).toBe(DEFAULT_MAX_IMAGE_SIZE)
+  })
 })
 
 import {
@@ -120,6 +150,9 @@ import {
   buildReactionBody,
   nextTxnId,
   roomNameCache,
+  sanitizeForFilename,
+  buildImagePath,
+  mxcToHttpUrl,
 } from './server'
 
 describe('buildSyncUrl', () => {
@@ -224,21 +257,161 @@ describe('parseSyncEvents', () => {
     expect(events[0].roomName).toBe('General')
   })
 
-  test('skips non-m.text messages', () => {
+  test('produces TextEvent with type discriminant', () => {
     const syncResponse = {
-      next_batch: 's',
       rooms: {
         join: {
           '!r:x': {
             timeline: {
-              events: [
-                {
-                  type: 'm.room.message',
-                  sender: '@a:x',
-                  event_id: '$1',
-                  content: { msgtype: 'm.image', body: 'photo.jpg' },
+              events: [{
+                type: 'm.room.message',
+                sender: '@a:x',
+                event_id: '$1',
+                content: { msgtype: 'm.text', body: 'hi' },
+              }],
+            },
+            state: { events: [] },
+          },
+        },
+      },
+    }
+    const events = parseSyncEvents(syncResponse)
+    expect(events).toHaveLength(1)
+    expect(events[0].type).toBe('text')
+  })
+
+  test('produces ImageEvent for m.image messages', () => {
+    const syncResponse = {
+      rooms: {
+        join: {
+          '!r:x': {
+            timeline: {
+              events: [{
+                type: 'm.room.message',
+                sender: '@a:x',
+                event_id: '$1',
+                content: {
+                  msgtype: 'm.image',
+                  body: 'photo.jpg',
+                  url: 'mxc://example.com/abc123',
+                  filename: 'photo.jpg',
+                  info: { mimetype: 'image/jpeg', size: 12345 },
                 },
-              ],
+              }],
+            },
+            state: { events: [] },
+          },
+        },
+      },
+    }
+
+    const events = parseSyncEvents(syncResponse)
+    expect(events).toHaveLength(1)
+    expect(events[0].type).toBe('image')
+    const img = events[0] as ImageEvent
+    expect(img.mxcUrl).toBe('mxc://example.com/abc123')
+    expect(img.mimeType).toBe('image/jpeg')
+    expect(img.size).toBe(12345)
+    expect(img.filename).toBe('photo.jpg')
+    expect(img.body).toBe('photo.jpg')
+  })
+
+  test('produces TextEvent with explanation for encrypted images', () => {
+    const syncResponse = {
+      rooms: {
+        join: {
+          '!r:x': {
+            timeline: {
+              events: [{
+                type: 'm.room.message',
+                sender: '@a:x',
+                event_id: '$1',
+                content: {
+                  msgtype: 'm.image',
+                  body: 'photo.jpg',
+                  file: { url: 'mxc://example.com/encrypted', key: {} },
+                },
+              }],
+            },
+            state: { events: [] },
+          },
+        },
+      },
+    }
+
+    const events = parseSyncEvents(syncResponse)
+    expect(events).toHaveLength(1)
+    expect(events[0].type).toBe('text')
+    expect(events[0].body).toContain('Encrypted image not supported')
+    expect(events[0].body).toContain('photo.jpg')
+  })
+
+  test('skips m.image with no url and no file (malformed)', () => {
+    const syncResponse = {
+      rooms: {
+        join: {
+          '!r:x': {
+            timeline: {
+              events: [{
+                type: 'm.room.message',
+                sender: '@a:x',
+                event_id: '$1',
+                content: { msgtype: 'm.image', body: 'photo.jpg' },
+              }],
+            },
+            state: { events: [] },
+          },
+        },
+      },
+    }
+
+    const events = parseSyncEvents(syncResponse)
+    expect(events).toHaveLength(0)
+  })
+
+  test('handles m.image with missing info gracefully', () => {
+    const syncResponse = {
+      rooms: {
+        join: {
+          '!r:x': {
+            timeline: {
+              events: [{
+                type: 'm.room.message',
+                sender: '@a:x',
+                event_id: '$1',
+                content: {
+                  msgtype: 'm.image',
+                  body: 'photo.jpg',
+                  url: 'mxc://example.com/abc123',
+                },
+              }],
+            },
+            state: { events: [] },
+          },
+        },
+      },
+    }
+
+    const events = parseSyncEvents(syncResponse)
+    expect(events).toHaveLength(1)
+    const img = events[0] as ImageEvent
+    expect(img.mimeType).toBe('application/octet-stream')
+    expect(img.size).toBeNull()
+    expect(img.filename).toBeNull()
+  })
+
+  test('skips unknown msgtypes like m.video', () => {
+    const syncResponse = {
+      rooms: {
+        join: {
+          '!r:x': {
+            timeline: {
+              events: [{
+                type: 'm.room.message',
+                sender: '@a:x',
+                event_id: '$1',
+                content: { msgtype: 'm.video', body: 'video.mp4', url: 'mxc://x/y' },
+              }],
             },
             state: { events: [] },
           },
@@ -318,15 +491,105 @@ describe('nextTxnId', () => {
   })
 })
 
+describe('mxcToHttpUrl', () => {
+  const base = 'https://matrix.example.com'
+
+  test('converts valid mxc URL to authenticated download endpoint', () => {
+    const url = mxcToHttpUrl(base, 'mxc://example.com/abc123')
+    expect(url).toBe('https://matrix.example.com/_matrix/client/v1/media/download/example.com/abc123')
+  })
+
+  test('handles homeserver with different domain than media server', () => {
+    const url = mxcToHttpUrl(base, 'mxc://other.server/media456')
+    expect(url).toBe('https://matrix.example.com/_matrix/client/v1/media/download/other.server/media456')
+  })
+
+  test('handles server name with port', () => {
+    const url = mxcToHttpUrl(base, 'mxc://example.com:8448/abc123')
+    expect(url).toBe('https://matrix.example.com/_matrix/client/v1/media/download/example.com%3A8448/abc123')
+  })
+
+  test('throws for non-mxc URL', () => {
+    expect(() => mxcToHttpUrl(base, 'https://example.com/file.png')).toThrow()
+  })
+
+  test('throws for mxc URL missing media ID', () => {
+    expect(() => mxcToHttpUrl(base, 'mxc://example.com')).toThrow()
+  })
+
+  test('throws for mxc URL missing server name', () => {
+    expect(() => mxcToHttpUrl(base, 'mxc://')).toThrow()
+  })
+
+  test('throws for empty string', () => {
+    expect(() => mxcToHttpUrl(base, '')).toThrow()
+  })
+})
+
+describe('sanitizeForFilename', () => {
+  test('replaces special characters with underscores', () => {
+    expect(sanitizeForFilename('$evt1:example.com')).toBe('_evt1_example_com')
+  })
+
+  test('preserves alphanumeric characters', () => {
+    expect(sanitizeForFilename('abc123')).toBe('abc123')
+  })
+
+  test('preserves dots and hyphens when allowDots is true', () => {
+    expect(sanitizeForFilename('photo.png', true)).toBe('photo.png')
+    expect(sanitizeForFilename('my-file.jpg', true)).toBe('my-file.jpg')
+  })
+
+  test('replaces dots when allowDots is false (default)', () => {
+    expect(sanitizeForFilename('photo.png')).toBe('photo_png')
+  })
+
+  test('truncates to maxLength', () => {
+    const long = 'a'.repeat(200)
+    expect(sanitizeForFilename(long, false, 100)).toHaveLength(100)
+  })
+
+  test('strips path traversal characters but preserves dots when allowDots is true', () => {
+    expect(sanitizeForFilename('../../etc/passwd', true)).toBe('.._.._etc_passwd')
+  })
+})
+
+describe('buildImagePath', () => {
+  test('builds path from event ID and filename', () => {
+    const path = buildImagePath('$evt1:example.com', 'photo.png')
+    expect(path).toBe('/tmp/claude-matrix-images/_evt1_example_com-photo.png')
+  })
+
+  test('derives filename from MIME type when filename is null', () => {
+    const path = buildImagePath('$evt1:x', null, 'image/png')
+    expect(path).toBe('/tmp/claude-matrix-images/_evt1_x-image.png')
+  })
+
+  test('falls back to .bin extension for unknown MIME type', () => {
+    const path = buildImagePath('$evt1:x', null, 'application/octet-stream')
+    expect(path).toBe('/tmp/claude-matrix-images/_evt1_x-image.bin')
+  })
+
+  test('sanitizes filename to prevent path traversal', () => {
+    const result = buildImagePath('$evt1:x', '../../etc/passwd.png')
+    expect(result).toStartWith('/tmp/claude-matrix-images/')
+    // The filename portion should not contain path separators
+    const filename = result.split('/tmp/claude-matrix-images/')[1]
+    expect(filename).not.toContain('/')
+  })
+})
+
 describe('shouldForwardEvent', () => {
   const access: Access = {
     allowedUsers: ['@alice:example.com', '@bob:example.com'],
     ackReaction: '👀',
+    maxImageSize: DEFAULT_MAX_IMAGE_SIZE,
   }
   const botUserId = '@bot:example.com'
 
   test('forwards events from allowed users', () => {
     const event: SyncEvent = {
+      type: 'text',
       roomId: '!r:x', roomName: 'General',
       sender: '@alice:example.com', eventId: '$1', body: 'hi',
     }
@@ -335,6 +598,7 @@ describe('shouldForwardEvent', () => {
 
   test('drops events from non-allowed users', () => {
     const event: SyncEvent = {
+      type: 'text',
       roomId: '!r:x', roomName: 'General',
       sender: '@mallory:example.com', eventId: '$1', body: 'hi',
     }
@@ -343,6 +607,7 @@ describe('shouldForwardEvent', () => {
 
   test('drops events from the bot itself', () => {
     const event: SyncEvent = {
+      type: 'text',
       roomId: '!r:x', roomName: 'General',
       sender: '@bot:example.com', eventId: '$1', body: 'hi',
     }
@@ -350,8 +615,9 @@ describe('shouldForwardEvent', () => {
   })
 
   test('drops all events when allowedUsers is empty', () => {
-    const emptyAccess: Access = { allowedUsers: [], ackReaction: null }
+    const emptyAccess: Access = { allowedUsers: [], ackReaction: null, maxImageSize: DEFAULT_MAX_IMAGE_SIZE }
     const event: SyncEvent = {
+      type: 'text',
       roomId: '!r:x', roomName: 'General',
       sender: '@alice:example.com', eventId: '$1', body: 'hi',
     }
@@ -360,6 +626,7 @@ describe('shouldForwardEvent', () => {
 
   test('forwards events from allowed rooms when roomIds is set', () => {
     const event: SyncEvent = {
+      type: 'text',
       roomId: '!room1:x', roomName: 'General',
       sender: '@alice:example.com', eventId: '$1', body: 'hi',
     }
@@ -368,6 +635,7 @@ describe('shouldForwardEvent', () => {
 
   test('drops events from rooms not in roomIds filter', () => {
     const event: SyncEvent = {
+      type: 'text',
       roomId: '!other:x', roomName: 'Random',
       sender: '@alice:example.com', eventId: '$1', body: 'hi',
     }
@@ -376,6 +644,7 @@ describe('shouldForwardEvent', () => {
 
   test('forwards all rooms when roomIds is null', () => {
     const event: SyncEvent = {
+      type: 'text',
       roomId: '!any:x', roomName: 'Whatever',
       sender: '@alice:example.com', eventId: '$1', body: 'hi',
     }
@@ -387,6 +656,7 @@ describe('shouldAutoJoin', () => {
   const access: Access = {
     allowedUsers: ['@alice:example.com'],
     ackReaction: null,
+    maxImageSize: DEFAULT_MAX_IMAGE_SIZE,
   }
 
   test('joins when inviter is in allowedUsers', () => {
@@ -407,5 +677,190 @@ describe('shouldAutoJoin', () => {
 
   test('joins any room when roomIds is null', () => {
     expect(shouldAutoJoin({ roomId: '!any:x', inviter: '@alice:example.com' }, access, null)).toBe(true)
+  })
+})
+
+describe('downloadImage', () => {
+  const config: Config = {
+    homeserverUrl: 'https://matrix.example.com',
+    accessToken: 'test-token',
+    botUserId: '@bot:example.com',
+    roomIds: null,
+  }
+  const access: Access = {
+    allowedUsers: [],
+    ackReaction: null,
+    maxImageSize: 1024, // 1KB for testing
+  }
+  const imageEvent: ImageEvent = {
+    type: 'image',
+    roomId: '!r:x',
+    roomName: 'General',
+    sender: '@alice:x',
+    eventId: '$test-img-evt',
+    body: 'photo.png',
+    mxcUrl: 'mxc://example.com/abc123',
+    mimeType: 'image/png',
+    size: 100,
+    filename: 'photo.png',
+  }
+
+  const originalFetch = global.fetch
+
+  afterEach(() => {
+    global.fetch = originalFetch
+    trackedImages.clear()
+    const dir = '/tmp/claude-matrix-images'
+    if (existsSync(dir)) rmSync(dir, { recursive: true })
+  })
+
+  test('downloads image and returns path on success', async () => {
+    const imageData = new Uint8Array(100).fill(0xFF)
+    global.fetch = async () => new Response(imageData, {
+      status: 200,
+      headers: { 'Content-Length': '100' },
+    })
+
+    const result = await downloadImage(config, access, imageEvent)
+    expect(result.imagePath).toBeTruthy()
+    expect(result.imagePath).toContain('photo.png')
+    expect(result.content).toContain('[Image: photo.png')
+    expect(result.content).toContain('Use the Read tool')
+    expect(existsSync(result.imagePath!)).toBe(true)
+  })
+
+  test('rejects when Content-Length exceeds maxImageSize', async () => {
+    global.fetch = async () => new Response('', {
+      status: 200,
+      headers: { 'Content-Length': '2048' },
+    })
+
+    const result = await downloadImage(config, access, imageEvent)
+    expect(result.imagePath).toBeNull()
+    expect(result.content).toContain('exceeds size limit')
+  })
+
+  test('returns fallback on fetch error', async () => {
+    global.fetch = async () => { throw new Error('Network error') }
+
+    const result = await downloadImage(config, access, imageEvent)
+    expect(result.imagePath).toBeNull()
+    expect(result.content).toContain('Image download failed')
+    expect(result.content).toContain('Network error')
+  })
+
+  test('returns fallback on non-200 response', async () => {
+    global.fetch = async () => new Response('Not Found', { status: 404 })
+
+    const result = await downloadImage(config, access, imageEvent)
+    expect(result.imagePath).toBeNull()
+    expect(result.content).toContain('Image download failed')
+  })
+
+  test('returns fallback on timeout', async () => {
+    global.fetch = async () => {
+      const err = new Error('timed out')
+      err.name = 'TimeoutError'
+      throw err
+    }
+
+    const result = await downloadImage(config, access, imageEvent)
+    expect(result.imagePath).toBeNull()
+    expect(result.content).toContain('timed out')
+  })
+
+  test('handles null filename by deriving from MIME type', async () => {
+    const noFilenameEvent: ImageEvent = { ...imageEvent, filename: null }
+    const imageData = new Uint8Array(50).fill(0xFF)
+    global.fetch = async () => new Response(imageData, {
+      status: 200,
+      headers: { 'Content-Length': '50' },
+    })
+
+    const result = await downloadImage(config, access, noFilenameEvent)
+    expect(result.imagePath).toContain('image.png')
+  })
+
+  test('skips download when event.size exceeds maxImageSize', async () => {
+    const oversizedEvent: ImageEvent = { ...imageEvent, size: 2048 }
+    global.fetch = async () => { throw new Error('fetch should not be called') }
+
+    const result = await downloadImage(config, access, oversizedEvent)
+    expect(result.imagePath).toBeNull()
+    expect(result.content).toContain('exceeds size limit')
+  })
+
+  test('aborts streaming download when body exceeds maxImageSize', async () => {
+    const largeData = new Uint8Array(2048).fill(0xFF)
+    global.fetch = async () => new Response(largeData, {
+      status: 200,
+      // No Content-Length header
+    })
+
+    const result = await downloadImage(config, access, imageEvent)
+    expect(result.imagePath).toBeNull()
+    expect(result.content).toContain('exceeds size limit')
+  })
+})
+
+describe('scheduleImageCleanup', () => {
+  const testDir = '/tmp/claude-matrix-images-test'
+  const testFile = `${testDir}/cleanup-test.png`
+
+  beforeEach(() => {
+    mkdirSync(testDir, { recursive: true })
+    writeFileSync(testFile, 'test')
+  })
+
+  afterEach(() => {
+    if (existsSync(testDir)) rmSync(testDir, { recursive: true })
+  })
+
+  test('deletes file after delay', async () => {
+    expect(existsSync(testFile)).toBe(true)
+    trackedImages.add(testFile)
+    scheduleImageCleanup(testFile, 50)
+    await new Promise((r) => setTimeout(r, 100))
+    expect(existsSync(testFile)).toBe(false)
+    expect(trackedImages.has(testFile)).toBe(false)
+  })
+
+  test('does not throw when file is already gone', async () => {
+    rmSync(testFile)
+    trackedImages.add(testFile)
+    scheduleImageCleanup(testFile, 50)
+    await new Promise((r) => setTimeout(r, 100))
+    expect(trackedImages.has(testFile)).toBe(false)
+  })
+})
+
+describe('cleanupAllImages', () => {
+  const testDir = '/tmp/claude-matrix-images-cleanup'
+
+  afterEach(() => {
+    trackedImages.clear()
+    if (existsSync(testDir)) rmSync(testDir, { recursive: true })
+  })
+
+  test('removes all tracked files and clears the set', () => {
+    mkdirSync(testDir, { recursive: true })
+    const file1 = `${testDir}/a.png`
+    const file2 = `${testDir}/b.png`
+    writeFileSync(file1, 'a')
+    writeFileSync(file2, 'b')
+    trackedImages.add(file1)
+    trackedImages.add(file2)
+
+    cleanupAllImages()
+
+    expect(existsSync(file1)).toBe(false)
+    expect(existsSync(file2)).toBe(false)
+    expect(trackedImages.size).toBe(0)
+  })
+
+  test('handles already-deleted files without throwing', () => {
+    trackedImages.add('/tmp/nonexistent-image.png')
+    cleanupAllImages()
+    expect(trackedImages.size).toBe(0)
   })
 })

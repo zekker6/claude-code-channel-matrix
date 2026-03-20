@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -22,11 +22,13 @@ export interface Config {
 export interface Access {
   allowedUsers: string[]
   ackReaction: string | null
+  maxImageSize: number
 }
 
 // ── Config ─────────────────────────────────────────────
 
 const CHANNELS_DIR = join(homedir(), '.claude', 'channels', 'matrix')
+export const DEFAULT_MAX_IMAGE_SIZE = 10 * 1024 * 1024 // 10 MB
 
 function requireEnv(name: string): string {
   const value = process.env[name]
@@ -74,7 +76,7 @@ export function loadConfig(envDir?: string): Config {
 export function loadAccess(path?: string): Access {
   const filePath = path ?? join(CHANNELS_DIR, 'access.json')
   if (!existsSync(filePath)) {
-    return { allowedUsers: [], ackReaction: null }
+    return { allowedUsers: [], ackReaction: null, maxImageSize: DEFAULT_MAX_IMAGE_SIZE }
   }
   let raw: any
   try {
@@ -82,11 +84,12 @@ export function loadAccess(path?: string): Access {
   } catch (err) {
     console.error(`Failed to parse ${filePath}: ${err instanceof Error ? err.message : err}`)
     console.error('Falling back to default access config (no allowed users)')
-    return { allowedUsers: [], ackReaction: null }
+    return { allowedUsers: [], ackReaction: null, maxImageSize: DEFAULT_MAX_IMAGE_SIZE }
   }
   return {
     allowedUsers: Array.isArray(raw.allowedUsers) ? raw.allowedUsers : [],
     ackReaction: raw.ackReaction ?? null,
+    maxImageSize: typeof raw.maxImageSize === 'number' ? raw.maxImageSize : 10 * 1024 * 1024,
   }
 }
 
@@ -101,13 +104,28 @@ const SYNC_FILTER = JSON.stringify({
   account_data: { types: [] },
 })
 
-export interface SyncEvent {
+export interface BaseEvent {
   roomId: string
   roomName: string
   sender: string
   eventId: string
+}
+
+export interface TextEvent extends BaseEvent {
+  type: 'text'
   body: string
 }
+
+export interface ImageEvent extends BaseEvent {
+  type: 'image'
+  body: string
+  mxcUrl: string
+  mimeType: string
+  size: number | null
+  filename: string | null
+}
+
+export type SyncEvent = TextEvent | ImageEvent
 
 export interface SyncInvite {
   roomId: string
@@ -149,15 +167,45 @@ export function parseSyncEvents(data: any): SyncEvent[] {
 
     for (const event of room.timeline?.events ?? []) {
       if (event.type !== 'm.room.message') continue
-      if (event.content?.msgtype !== 'm.text') continue
 
-      events.push({
-        roomId,
-        roomName,
-        sender: event.sender,
-        eventId: event.event_id,
-        body: event.content.body,
-      })
+      const msgtype = event.content?.msgtype
+      if (msgtype === 'm.text') {
+        events.push({
+          type: 'text',
+          roomId,
+          roomName,
+          sender: event.sender,
+          eventId: event.event_id,
+          body: event.content.body,
+        })
+      } else if (msgtype === 'm.image') {
+        if (!event.content.url) {
+          if (event.content.file) {
+            console.error(`Skipping encrypted image (E2EE not supported) in ${roomId}`)
+            events.push({
+              type: 'text',
+              roomId,
+              roomName,
+              sender: event.sender,
+              eventId: event.event_id,
+              body: `[Encrypted image not supported: ${event.content.body ?? 'image'}] This room uses E2EE — the plugin cannot decrypt media.`,
+            })
+          }
+          continue
+        }
+        events.push({
+          type: 'image',
+          roomId,
+          roomName,
+          sender: event.sender,
+          eventId: event.event_id,
+          body: event.content.body ?? event.content.filename ?? 'image',
+          mxcUrl: event.content.url,
+          mimeType: event.content.info?.mimetype ?? 'application/octet-stream',
+          size: event.content.info?.size ?? null,
+          filename: event.content.filename ?? null,
+        })
+      }
     }
   }
 
@@ -200,6 +248,179 @@ export function buildReactionBody(eventId: string, emoji: string) {
       event_id: eventId,
       key: emoji,
     },
+  }
+}
+
+export function mxcToHttpUrl(homeserverUrl: string, mxcUrl: string): string {
+  if (!mxcUrl.startsWith('mxc://')) {
+    throw new Error(`Invalid MXC URL: ${mxcUrl}`)
+  }
+  const withoutScheme = mxcUrl.slice('mxc://'.length)
+  const slashIdx = withoutScheme.indexOf('/')
+  if (slashIdx <= 0 || slashIdx === withoutScheme.length - 1) {
+    throw new Error(`Invalid MXC URL (missing server or media ID): ${mxcUrl}`)
+  }
+  const serverName = withoutScheme.slice(0, slashIdx)
+  const mediaId = withoutScheme.slice(slashIdx + 1)
+  return `${homeserverUrl}/_matrix/client/v1/media/download/${encodeURIComponent(serverName)}/${encodeURIComponent(mediaId)}`
+}
+
+const IMAGE_DIR = '/tmp/claude-matrix-images'
+const IMAGE_CLEANUP_DELAY_MS = 5 * 60 * 1000 // 5 minutes
+
+/** Tracks all image files written during this session for exit cleanup. */
+export const trackedImages = new Set<string>()
+
+export function scheduleImageCleanup(filePath: string, delayMs = IMAGE_CLEANUP_DELAY_MS): void {
+  setTimeout(() => {
+    try {
+      unlinkSync(filePath)
+      trackedImages.delete(filePath)
+      console.error(`Cleaned up image: ${filePath}`)
+    } catch {
+      trackedImages.delete(filePath)
+    }
+  }, delayMs).unref()
+}
+
+export function cleanupAllImages(): void {
+  for (const filePath of trackedImages) {
+    try {
+      unlinkSync(filePath)
+    } catch {
+      // already gone
+    }
+  }
+  const count = trackedImages.size
+  trackedImages.clear()
+  if (count > 0) {
+    console.error(`Exit cleanup: removed ${count} image(s)`)
+  }
+  // Remove the directory itself if empty
+  try {
+    rmdirSync(IMAGE_DIR)
+  } catch {
+    // not empty or doesn't exist
+  }
+}
+
+const MIME_TO_EXT: Record<string, string> = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'image/svg+xml': '.svg',
+  'image/bmp': '.bmp',
+  'image/tiff': '.tiff',
+}
+
+export function sanitizeForFilename(
+  input: string,
+  allowDots = false,
+  maxLength = 100,
+): string {
+  const pattern = allowDots ? /[^a-zA-Z0-9._-]/g : /[^a-zA-Z0-9_-]/g
+  return input.replace(pattern, '_').slice(0, maxLength)
+}
+
+export function buildImagePath(
+  eventId: string,
+  filename: string | null,
+  mimeType = 'application/octet-stream',
+): string {
+  const safeName = filename
+    ? sanitizeForFilename(filename, true)
+    : `image${MIME_TO_EXT[mimeType] ?? '.bin'}`
+  const safeEventId = sanitizeForFilename(eventId)
+  return join(IMAGE_DIR, `${safeEventId}-${safeName}`)
+}
+
+function formatSize(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)}KB`
+  return `${bytes}B`
+}
+
+export async function downloadImage(
+  config: Config,
+  access: Access,
+  event: ImageEvent,
+): Promise<{ content: string; imagePath: string | null }> {
+  const displayName = event.filename ?? event.body
+
+  // Early skip if event metadata already indicates oversized image
+  if (event.size && event.size > access.maxImageSize) {
+    return {
+      content: `[Image skipped: exceeds size limit of ${formatSize(access.maxImageSize)}] ${displayName}`,
+      imagePath: null,
+    }
+  }
+
+  try {
+    const url = mxcToHttpUrl(config.homeserverUrl, event.mxcUrl)
+
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${config.accessToken}` },
+      signal: AbortSignal.timeout(30000),
+    })
+
+    if (!res.ok) {
+      return {
+        content: `[Image download failed: HTTP ${res.status}] ${displayName}`,
+        imagePath: null,
+      }
+    }
+
+    // Early reject via Content-Length
+    const contentLength = Number(res.headers.get('Content-Length'))
+    if (contentLength && contentLength > access.maxImageSize) {
+      return {
+        content: `[Image skipped: exceeds size limit of ${formatSize(access.maxImageSize)}] ${displayName}`,
+        imagePath: null,
+      }
+    }
+
+    // Stream body and enforce size limit
+    const chunks: Uint8Array[] = []
+    let totalBytes = 0
+    const reader = res.body!.getReader()
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      totalBytes += value.byteLength
+      if (totalBytes > access.maxImageSize) {
+        reader.cancel()
+        return {
+          content: `[Image skipped: exceeds size limit of ${formatSize(access.maxImageSize)}] ${displayName}`,
+          imagePath: null,
+        }
+      }
+      chunks.push(value)
+    }
+
+    // Write to disk
+    const filePath = buildImagePath(event.eventId, event.filename, event.mimeType)
+    mkdirSync(IMAGE_DIR, { recursive: true, mode: 0o700 })
+    const buffer = Buffer.concat(chunks)
+    writeFileSync(filePath, buffer, { mode: 0o600 })
+    trackedImages.add(filePath)
+
+    return {
+      content: `[Image: ${displayName} (${event.mimeType}, ${formatSize(totalBytes)})]\nUse the Read tool to view the image at ${filePath}`,
+      imagePath: filePath,
+    }
+  } catch (err: any) {
+    if (err.name === 'TimeoutError') {
+      return {
+        content: `[Image download failed: timed out] ${displayName}`,
+        imagePath: null,
+      }
+    }
+    return {
+      content: `[Image download failed: ${err.message ?? err}] ${displayName}`,
+      imagePath: null,
+    }
   }
 }
 
@@ -289,7 +510,7 @@ async function matrixReact(
 
 function createMcpServer(config: Config): Server {
   const mcp = new Server(
-    { name: 'matrix', version: '0.1.0' },
+    { name: 'matrix', version: '0.3.0' },
     {
       capabilities: {
         experimental: { 'claude/channel': {} },
@@ -297,7 +518,8 @@ function createMcpServer(config: Config): Server {
       },
       instructions:
         'Messages arrive as <channel source="matrix" room_id="!abc:domain" room_name="General" sender="@user:domain" event_id="$evt:domain">. ' +
-        'Reply with the reply tool (pass room_id). React with the react tool (pass room_id, event_id, emoji).',
+        'Reply with the reply tool (pass room_id). React with the react tool (pass room_id, event_id, emoji). ' +
+        'When a message contains an image file path, use the Read tool to view it before responding.',
     },
   )
 
@@ -437,19 +659,34 @@ async function runSyncLoop(
       for (const event of events) {
         if (!shouldForwardEvent(event, access, config.botUserId, config.roomIds)) continue
 
+        let content: string
+        const meta: Record<string, string> = {
+          room_id: event.roomId,
+          room_name: event.roomName,
+          sender: event.sender,
+          event_id: event.eventId,
+        }
+
+        if (event.type === 'text') {
+          content = event.body
+        } else {
+          const result = await downloadImage(config, access, event)
+          content = result.content
+          if (result.imagePath) {
+            meta.image_path = result.imagePath
+          }
+        }
+
         // Forward to Claude
         await mcp.notification({
           method: 'notifications/claude/channel',
-          params: {
-            content: event.body,
-            meta: {
-              room_id: event.roomId,
-              room_name: event.roomName,
-              sender: event.sender,
-              event_id: event.eventId,
-            },
-          },
+          params: { content, meta },
         })
+
+        // Schedule image cleanup after Claude has had time to read it
+        if (meta.image_path) {
+          scheduleImageCleanup(meta.image_path)
+        }
 
         // Ack reaction
         if (access.ackReaction) {
@@ -475,6 +712,11 @@ async function runSyncLoop(
 if (import.meta.main) {
   const config = loadConfig()
   const access = loadAccess()
+
+  // Clean up downloaded images on exit
+  process.on('SIGINT', () => { cleanupAllImages(); process.exit(0) })
+  process.on('SIGTERM', () => { cleanupAllImages(); process.exit(0) })
+  process.on('exit', cleanupAllImages)
 
   console.error(`Matrix channel starting for ${config.botUserId}`)
   console.error(`Homeserver: ${config.homeserverUrl}`)
