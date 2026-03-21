@@ -82,7 +82,9 @@ Set `ackReaction` to an emoji string to have the bot react to every forwarded me
 
 ## Per-project threading
 
-When threading is enabled, each Claude Code session creates its own thread in each Matrix room. This keeps conversations organized - replies from different projects don't mix in the room timeline.
+When threading is enabled, each Claude Code session creates its own thread in the designated anchor room. This keeps conversations organized — replies from different projects don't mix in the room timeline.
+
+**Thread mode and room mode are mutually exclusive.** Use `MATRIX_ROOM_IDS` for multi-room listening without threads, or `MATRIX_THREAD_ROOT_ROOM_ID` for single-room threading.
 
 ### Enabling threads
 
@@ -90,31 +92,31 @@ Add to your `.env` file or set as environment variables:
 
 ```
 MATRIX_THREADS=true
+MATRIX_THREAD_ROOT_ROOM_ID=!your-room-id:example.com
 ```
 
 The project name defaults to the basename of Claude Code's working directory. To override it:
 
 ```
 MATRIX_THREADS=true
+MATRIX_THREAD_ROOT_ROOM_ID=!your-room-id:example.com
 MATRIX_THREAD_PROJECT=my-project
 ```
 
 ### How it works
 
-1. You send a message in a DM room - the plugin creates a thread root message ("Thread: my-project") in that room
+1. On startup, the plugin creates a thread root message ("Thread: my-project") in the anchor room
 2. In Element (or any thread-aware client), you see the thread and reply within it
 3. Claude receives threaded messages and replies inside the thread
-4. Non-threaded messages are always ignored when threading is enabled - use the thread
+4. Non-threaded messages are always ignored when threading is enabled — use the thread
 
 Thread roots are persisted in `~/.claude/channels/matrix/threads.json`, so the same thread is reused across sessions for the same project.
 
 ### Multiple projects
 
-If you run Claude Code sessions in different project directories simultaneously, each session creates its own thread. Messages in a project's thread are only forwarded to that project's session. The first non-threaded message in a room bootstraps a new thread - after that, communicate through the thread.
+If you run Claude Code sessions in different project directories simultaneously, each session creates its own thread in the anchor room. Messages in a project's thread are only forwarded to that project's session.
 
-### With room filtering
-
-Threading works with or without `MATRIX_ROOM_IDS`. When both are set, threads are only created in the configured rooms.
+> **Breaking change:** Previous versions allowed `MATRIX_ROOM_IDS` alongside `MATRIX_THREADS=true`. This is no longer valid — use `MATRIX_THREAD_ROOT_ROOM_ID` instead.
 
 ## Optional configuration
 

@@ -18,6 +18,7 @@ export interface Config {
   botUserId: string
   roomIds: string[] | null
   threadProject: string | null
+  threadRootRoomId: string | null
 }
 
 export interface Access {
@@ -75,6 +76,19 @@ export function loadConfig(envDir?: string): Config {
   const roomIds = rawRoomIds ? rawRoomIds.split(',').map((id) => id.trim()).filter(Boolean) : null
 
   const threadsEnabled = process.env.MATRIX_THREADS === 'true'
+  const threadRootRoomId = process.env.MATRIX_THREAD_ROOT_ROOM_ID?.trim() || null
+
+  // Strict mode enforcement
+  if (threadRootRoomId && !threadsEnabled) {
+    throw new Error('MATRIX_THREAD_ROOT_ROOM_ID requires MATRIX_THREADS=true')
+  }
+  if (threadsEnabled && !threadRootRoomId) {
+    throw new Error('MATRIX_THREADS=true requires MATRIX_THREAD_ROOT_ROOM_ID')
+  }
+  if (roomIds && threadRootRoomId) {
+    throw new Error('MATRIX_ROOM_IDS and MATRIX_THREAD_ROOT_ROOM_ID are mutually exclusive')
+  }
+
   const threadProject = threadsEnabled
     ? (process.env.MATRIX_THREAD_PROJECT || basename(process.cwd()))
     : null
@@ -83,8 +97,9 @@ export function loadConfig(envDir?: string): Config {
     homeserverUrl,
     accessToken: requireEnv('MATRIX_ACCESS_TOKEN'),
     botUserId: requireEnv('MATRIX_BOT_USER_ID'),
-    roomIds,
+    roomIds: threadRootRoomId ? [threadRootRoomId] : roomIds,
     threadProject,
+    threadRootRoomId,
   }
 }
 
@@ -605,7 +620,7 @@ async function ensureThreadRoot(
 
 function createMcpServer(config: Config, threadRootByRoom: Map<string, string>): Server {
   const mcp = new Server(
-    { name: 'matrix', version: '0.4.0' },
+    { name: 'matrix', version: '0.4.1' },
     {
       capabilities: {
         experimental: { 'claude/channel': {} },
@@ -734,18 +749,18 @@ async function runSyncLoop(
     throw err
   }
 
-  // Pre-load persisted thread roots when threading is enabled
-  if (config.threadProject) {
+  // Pre-load persisted thread roots and eagerly create if missing
+  if (config.threadProject && config.threadRootRoomId) {
     const roots = loadThreadRoots()
-    for (const [key, eventId] of roots) {
-      // Keys are "roomId:project" — only load roots for our project
-      if (key.endsWith(`:${config.threadProject}`)) {
-        const roomId = key.slice(0, key.length - config.threadProject.length - 1)
-        threadRootByRoom.set(roomId, eventId)
-      }
-    }
-    if (threadRootByRoom.size > 0) {
-      console.error(`Loaded ${threadRootByRoom.size} persisted thread root(s) for "${config.threadProject}"`)
+    const key = `${config.threadRootRoomId}:${config.threadProject}`
+    const existing = roots.get(key)
+    if (existing) {
+      threadRootByRoom.set(config.threadRootRoomId, existing)
+      console.error(`Loaded persisted thread root for "${config.threadProject}" in ${config.threadRootRoomId}: ${existing}`)
+    } else {
+      // Eagerly create thread root — crash on failure since thread mode cannot function without it
+      const rootId = await ensureThreadRoot(config, config.threadRootRoomId, config.threadProject)
+      threadRootByRoom.set(config.threadRootRoomId, rootId)
     }
   }
 
@@ -772,22 +787,13 @@ async function runSyncLoop(
       for (const event of events) {
         if (!shouldForwardEvent(event, access, config.botUserId, config.roomIds)) continue
 
-        // Thread routing: when threads are enabled, filter and lazily create roots
+        // Thread routing: when threads are enabled, only accept messages in our thread
         if (config.threadProject) {
           if (event.threadRootId) {
-            // Threaded message — only accept if it's in our project's thread
             const ourRoot = threadRootByRoom.get(event.roomId)
             if (event.threadRootId !== ourRoot) continue
           } else {
-            // Non-threaded message — always drop, but create thread root if needed
-            if (!threadRootByRoom.has(event.roomId)) {
-              try {
-                const rootId = await ensureThreadRoot(config, event.roomId, config.threadProject)
-                threadRootByRoom.set(event.roomId, rootId)
-              } catch (err) {
-                console.error(`Failed to create thread root in ${event.roomId}:`, err)
-              }
-            }
+            // Non-threaded message — always drop in thread mode
             continue
           }
         }

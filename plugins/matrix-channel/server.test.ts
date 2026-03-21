@@ -16,6 +16,8 @@ describe('loadConfig', () => {
     process.env.MATRIX_HOMESERVER_URL = 'https://matrix.example.com'
     process.env.MATRIX_ACCESS_TOKEN = 'syt_test_token'
     process.env.MATRIX_BOT_USER_ID = '@bot:example.com'
+    delete process.env.MATRIX_THREADS
+    delete process.env.MATRIX_THREAD_ROOT_ROOM_ID
 
     const config = loadConfig('/tmp/no-such-dir')
     expect(config.homeserverUrl).toBe('https://matrix.example.com')
@@ -27,6 +29,8 @@ describe('loadConfig', () => {
     process.env.MATRIX_HOMESERVER_URL = 'https://matrix.example.com/'
     process.env.MATRIX_ACCESS_TOKEN = 'token'
     process.env.MATRIX_BOT_USER_ID = '@bot:example.com'
+    delete process.env.MATRIX_THREADS
+    delete process.env.MATRIX_THREAD_ROOT_ROOM_ID
 
     const config = loadConfig('/tmp/no-such-dir')
     expect(config.homeserverUrl).toBe('https://matrix.example.com')
@@ -36,6 +40,8 @@ describe('loadConfig', () => {
     process.env.MATRIX_HOMESERVER_URL = 'matrix.example.com'
     process.env.MATRIX_ACCESS_TOKEN = 'token'
     process.env.MATRIX_BOT_USER_ID = '@bot:example.com'
+    delete process.env.MATRIX_THREADS
+    delete process.env.MATRIX_THREAD_ROOT_ROOM_ID
 
     const config = loadConfig('/tmp/no-such-dir')
     expect(config.homeserverUrl).toBe('https://matrix.example.com')
@@ -45,6 +51,8 @@ describe('loadConfig', () => {
     delete process.env.MATRIX_HOMESERVER_URL
     process.env.MATRIX_ACCESS_TOKEN = 'token'
     process.env.MATRIX_BOT_USER_ID = '@bot:example.com'
+    delete process.env.MATRIX_THREADS
+    delete process.env.MATRIX_THREAD_ROOT_ROOM_ID
 
     expect(() => loadConfig('/tmp/no-such-dir')).toThrow('MATRIX_HOMESERVER_URL')
   })
@@ -53,6 +61,8 @@ describe('loadConfig', () => {
     process.env.MATRIX_HOMESERVER_URL = 'https://matrix.example.com'
     delete process.env.MATRIX_ACCESS_TOKEN
     process.env.MATRIX_BOT_USER_ID = '@bot:example.com'
+    delete process.env.MATRIX_THREADS
+    delete process.env.MATRIX_THREAD_ROOT_ROOM_ID
 
     expect(() => loadConfig('/tmp/no-such-dir')).toThrow('MATRIX_ACCESS_TOKEN')
   })
@@ -61,6 +71,8 @@ describe('loadConfig', () => {
     process.env.MATRIX_HOMESERVER_URL = 'https://matrix.example.com'
     process.env.MATRIX_ACCESS_TOKEN = 'token'
     delete process.env.MATRIX_BOT_USER_ID
+    delete process.env.MATRIX_THREADS
+    delete process.env.MATRIX_THREAD_ROOT_ROOM_ID
 
     expect(() => loadConfig('/tmp/no-such-dir')).toThrow('MATRIX_BOT_USER_ID')
   })
@@ -70,6 +82,8 @@ describe('loadConfig', () => {
     process.env.MATRIX_ACCESS_TOKEN = 'token'
     process.env.MATRIX_BOT_USER_ID = '@bot:example.com'
     process.env.MATRIX_ROOM_IDS = '!room1:example.com, !room2:example.com'
+    delete process.env.MATRIX_THREADS
+    delete process.env.MATRIX_THREAD_ROOT_ROOM_ID
 
     const config = loadConfig('/tmp/no-such-dir')
     expect(config.roomIds).toEqual(['!room1:example.com', '!room2:example.com'])
@@ -80,6 +94,8 @@ describe('loadConfig', () => {
     process.env.MATRIX_ACCESS_TOKEN = 'token'
     process.env.MATRIX_BOT_USER_ID = '@bot:example.com'
     delete process.env.MATRIX_ROOM_IDS
+    delete process.env.MATRIX_THREADS
+    delete process.env.MATRIX_THREAD_ROOT_ROOM_ID
 
     const config = loadConfig('/tmp/no-such-dir')
     expect(config.roomIds).toBeNull()
@@ -111,7 +127,7 @@ describe('loadConfig thread settings', () => {
   test('auto-detects threadProject from cwd basename when MATRIX_THREADS=true', () => {
     baseEnv()
     process.env.MATRIX_THREADS = 'true'
-    process.env.MATRIX_ROOM_IDS = '!room1:example.com'
+    process.env.MATRIX_THREAD_ROOT_ROOM_ID = '!room1:example.com'
     delete process.env.MATRIX_THREAD_PROJECT
 
     const config = loadConfig('/tmp/no-such-dir')
@@ -121,7 +137,7 @@ describe('loadConfig thread settings', () => {
   test('uses MATRIX_THREAD_PROJECT override when set', () => {
     baseEnv()
     process.env.MATRIX_THREADS = 'true'
-    process.env.MATRIX_ROOM_IDS = '!room1:example.com'
+    process.env.MATRIX_THREAD_ROOT_ROOM_ID = '!room1:example.com'
     process.env.MATRIX_THREAD_PROJECT = 'my-custom-project'
 
     const config = loadConfig('/tmp/no-such-dir')
@@ -137,22 +153,71 @@ describe('loadConfig thread settings', () => {
     expect(config.threadProject).toBeNull()
   })
 
-  test('allows MATRIX_THREADS=true without MATRIX_ROOM_IDS', () => {
+  test('throws when MATRIX_THREAD_ROOT_ROOM_ID is set without MATRIX_THREADS=true', () => {
     baseEnv()
-    process.env.MATRIX_THREADS = 'true'
-    delete process.env.MATRIX_ROOM_IDS
+    delete process.env.MATRIX_THREADS
+    process.env.MATRIX_THREAD_ROOT_ROOM_ID = '!anchor:example.com'
 
-    const config = loadConfig('/tmp/no-such-dir')
-    expect(config.threadProject).toBeTruthy()
-    expect(config.roomIds).toBeNull()
+    expect(() => loadConfig('/tmp/no-such-dir')).toThrow('MATRIX_THREAD_ROOT_ROOM_ID requires MATRIX_THREADS=true')
   })
 
-  test('accepts MATRIX_THREADS=true when MATRIX_ROOM_IDS is set', () => {
+  test('throws when MATRIX_THREADS=true without MATRIX_THREAD_ROOT_ROOM_ID', () => {
+    baseEnv()
+    process.env.MATRIX_THREADS = 'true'
+    delete process.env.MATRIX_THREAD_ROOT_ROOM_ID
+
+    expect(() => loadConfig('/tmp/no-such-dir')).toThrow('MATRIX_THREADS=true requires MATRIX_THREAD_ROOT_ROOM_ID')
+  })
+
+  test('throws when both MATRIX_ROOM_IDS and MATRIX_THREAD_ROOT_ROOM_ID are set', () => {
     baseEnv()
     process.env.MATRIX_THREADS = 'true'
     process.env.MATRIX_ROOM_IDS = '!room1:example.com'
+    process.env.MATRIX_THREAD_ROOT_ROOM_ID = '!anchor:example.com'
 
-    expect(() => loadConfig('/tmp/no-such-dir')).not.toThrow()
+    expect(() => loadConfig('/tmp/no-such-dir')).toThrow('MATRIX_ROOM_IDS and MATRIX_THREAD_ROOT_ROOM_ID are mutually exclusive')
+  })
+
+  test('sets roomIds to [threadRootRoomId] in thread mode', () => {
+    baseEnv()
+    process.env.MATRIX_THREADS = 'true'
+    process.env.MATRIX_THREAD_ROOT_ROOM_ID = '!anchor:example.com'
+    delete process.env.MATRIX_ROOM_IDS
+
+    const config = loadConfig('/tmp/no-such-dir')
+    expect(config.roomIds).toEqual(['!anchor:example.com'])
+    expect(config.threadRootRoomId).toBe('!anchor:example.com')
+    expect(config.threadProject).toBeTruthy()
+  })
+
+  test('returns null threadRootRoomId in room mode', () => {
+    baseEnv()
+    process.env.MATRIX_ROOM_IDS = '!room1:example.com'
+    delete process.env.MATRIX_THREADS
+    delete process.env.MATRIX_THREAD_ROOT_ROOM_ID
+
+    const config = loadConfig('/tmp/no-such-dir')
+    expect(config.threadRootRoomId).toBeNull()
+    expect(config.threadProject).toBeNull()
+  })
+
+  test('treats MATRIX_THREADS=false same as unset', () => {
+    baseEnv()
+    process.env.MATRIX_THREADS = 'false'
+    delete process.env.MATRIX_THREAD_ROOT_ROOM_ID
+    delete process.env.MATRIX_ROOM_IDS
+
+    const config = loadConfig('/tmp/no-such-dir')
+    expect(config.threadProject).toBeNull()
+    expect(config.threadRootRoomId).toBeNull()
+  })
+
+  test('throws when MATRIX_THREADS=false with MATRIX_THREAD_ROOT_ROOM_ID set', () => {
+    baseEnv()
+    process.env.MATRIX_THREADS = 'false'
+    process.env.MATRIX_THREAD_ROOT_ROOM_ID = '!anchor:example.com'
+
+    expect(() => loadConfig('/tmp/no-such-dir')).toThrow('MATRIX_THREAD_ROOT_ROOM_ID requires MATRIX_THREADS=true')
   })
 })
 
@@ -823,6 +888,7 @@ describe('downloadImage', () => {
     botUserId: '@bot:example.com',
     roomIds: null,
     threadProject: null,
+    threadRootRoomId: null,
   }
   const access: Access = {
     allowedUsers: [],
