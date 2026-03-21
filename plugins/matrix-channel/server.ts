@@ -9,6 +9,12 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+import {
+  tryAcquireLock, MuxServer, MuxClient,
+  eventToFrame, frameToEvent,
+  loadSyncToken, saveSyncToken,
+  type WireFrame,
+} from './mux'
 
 // ── Types ──────────────────────────────────────────────
 
@@ -29,9 +35,22 @@ export interface Access {
 
 // ── Config ─────────────────────────────────────────────
 
-const CHANNELS_DIR = process.env.MATRIX_CHANNELS_DIR
+export const CHANNELS_DIR = process.env.MATRIX_CHANNELS_DIR
   ?? join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'channels', 'matrix')
 export const DEFAULT_MAX_IMAGE_SIZE = parseMaxImageSize(process.env.MATRIX_MAX_IMAGE_SIZE)
+
+// ── Cleanup Registry ──────────────────────────────────
+const cleanupFns: (() => void)[] = []
+
+function registerCleanup(fn: () => void): void {
+  cleanupFns.push(fn)
+}
+
+function runAllCleanup(): void {
+  for (const fn of cleanupFns) {
+    try { fn() } catch {}
+  }
+}
 
 function parseMaxImageSize(raw: string | undefined): number {
   if (!raw) return 10 * 1024 * 1024
@@ -620,7 +639,7 @@ async function ensureThreadRoot(
 
 function createMcpServer(config: Config, threadRootByRoom: Map<string, string>): Server {
   const mcp = new Server(
-    { name: 'matrix', version: '0.4.1' },
+    { name: 'matrix', version: '0.5.0' },
     {
       capabilities: {
         experimental: { 'claude/channel': {} },
@@ -716,6 +735,84 @@ export function shouldAutoJoin(
   return true
 }
 
+// ── Thread Root Setup ─────────────────────────────────
+
+export async function setupThreadRoots(
+  config: Config,
+  threadRootByRoom: Map<string, string>,
+): Promise<void> {
+  if (!config.threadProject || !config.threadRootRoomId) return
+  const roots = loadThreadRoots()
+  const key = `${config.threadRootRoomId}:${config.threadProject}`
+  const existing = roots.get(key)
+  if (existing) {
+    threadRootByRoom.set(config.threadRootRoomId, existing)
+    console.error(`Loaded persisted thread root for "${config.threadProject}" in ${config.threadRootRoomId}: ${existing}`)
+  } else {
+    const rootId = await ensureThreadRoot(config, config.threadRootRoomId, config.threadProject)
+    threadRootByRoom.set(config.threadRootRoomId, rootId)
+  }
+}
+
+// ── Event Processing ──────────────────────────────────
+
+export async function processEvents(
+  events: SyncEvent[],
+  config: Config,
+  access: Access,
+  threadRootByRoom: Map<string, string>,
+  mcp: Server,
+): Promise<void> {
+  for (const event of events) {
+    if (!shouldForwardEvent(event, access, config.botUserId, config.roomIds)) continue
+
+    if (config.threadProject) {
+      if (event.threadRootId) {
+        const ourRoot = threadRootByRoom.get(event.roomId)
+        if (event.threadRootId !== ourRoot) continue
+      } else {
+        continue
+      }
+    }
+
+    let content: string
+    const meta: Record<string, string> = {
+      room_id: event.roomId,
+      room_name: event.roomName,
+      sender: event.sender,
+      event_id: event.eventId,
+    }
+    if (config.threadProject) {
+      meta.thread_project = config.threadProject
+    }
+
+    if (event.type === 'text') {
+      content = event.body
+    } else {
+      const result = await downloadImage(config, access, event)
+      content = result.content
+      if (result.imagePath) {
+        meta.image_path = result.imagePath
+      }
+    }
+
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: { content, meta },
+    })
+
+    if (meta.image_path) {
+      scheduleImageCleanup(meta.image_path)
+    }
+
+    if (access.ackReaction) {
+      matrixReact(config, event.roomId, event.eventId, access.ackReaction).catch((err) =>
+        console.error(`Ack reaction failed for ${event.eventId}:`, err)
+      )
+    }
+  }
+}
+
 // ── Sync Loop ──────────────────────────────────────────
 
 async function runSyncLoop(
@@ -749,21 +846,6 @@ async function runSyncLoop(
     throw err
   }
 
-  // Pre-load persisted thread roots and eagerly create if missing
-  if (config.threadProject && config.threadRootRoomId) {
-    const roots = loadThreadRoots()
-    const key = `${config.threadRootRoomId}:${config.threadProject}`
-    const existing = roots.get(key)
-    if (existing) {
-      threadRootByRoom.set(config.threadRootRoomId, existing)
-      console.error(`Loaded persisted thread root for "${config.threadProject}" in ${config.threadRootRoomId}: ${existing}`)
-    } else {
-      // Eagerly create thread root — crash on failure since thread mode cannot function without it
-      const rootId = await ensureThreadRoot(config, config.threadRootRoomId, config.threadProject)
-      threadRootByRoom.set(config.threadRootRoomId, rootId)
-    }
-  }
-
   // Incremental sync loop
   while (true) {
     try {
@@ -784,59 +866,7 @@ async function runSyncLoop(
 
       // Process messages
       const events = parseSyncEvents(data)
-      for (const event of events) {
-        if (!shouldForwardEvent(event, access, config.botUserId, config.roomIds)) continue
-
-        // Thread routing: when threads are enabled, only accept messages in our thread
-        if (config.threadProject) {
-          if (event.threadRootId) {
-            const ourRoot = threadRootByRoom.get(event.roomId)
-            if (event.threadRootId !== ourRoot) continue
-          } else {
-            // Non-threaded message — always drop in thread mode
-            continue
-          }
-        }
-
-        let content: string
-        const meta: Record<string, string> = {
-          room_id: event.roomId,
-          room_name: event.roomName,
-          sender: event.sender,
-          event_id: event.eventId,
-        }
-        if (config.threadProject) {
-          meta.thread_project = config.threadProject
-        }
-
-        if (event.type === 'text') {
-          content = event.body
-        } else {
-          const result = await downloadImage(config, access, event)
-          content = result.content
-          if (result.imagePath) {
-            meta.image_path = result.imagePath
-          }
-        }
-
-        // Forward to Claude
-        await mcp.notification({
-          method: 'notifications/claude/channel',
-          params: { content, meta },
-        })
-
-        // Schedule image cleanup after Claude has had time to read it
-        if (meta.image_path) {
-          scheduleImageCleanup(meta.image_path)
-        }
-
-        // Ack reaction
-        if (access.ackReaction) {
-          matrixReact(config, event.roomId, event.eventId, access.ackReaction).catch((err) =>
-            console.error(`Ack reaction failed for ${event.eventId}:`, err)
-          )
-        }
-      }
+      await processEvents(events, config, access, threadRootByRoom, mcp)
 
       since = data.next_batch
       backoffMs = 5000 // reset on success
@@ -849,19 +879,169 @@ async function runSyncLoop(
   }
 }
 
+// ── Multiplexer Sync Loop ─────────────────────────────
+
+async function runMultiplexerSyncLoop(
+  config: Config,
+  access: Access,
+  muxServer: MuxServer,
+  channelsDir: string,
+  onEvents: (events: SyncEvent[]) => Promise<void>,
+): Promise<never> {
+  let since = loadSyncToken(channelsDir)
+  let backoffMs = 5000
+
+  if (!since) {
+    try {
+      console.error('Multiplexer: starting initial sync...')
+      const data = await matrixSync(config, null)
+      since = data.next_batch
+      saveSyncToken(channelsDir, since)
+      console.error(`Multiplexer: initial sync complete. Token: ${since}`)
+
+      const pendingInvites = parseSyncInvites(data)
+      for (const invite of pendingInvites) {
+        if (shouldAutoJoin(invite, access, config.roomIds)) {
+          console.error(`Auto-joining room ${invite.roomId}`)
+          matrixJoin(config, invite.roomId).catch((err) =>
+            console.error(`Failed to join ${invite.roomId}:`, err)
+          )
+        }
+      }
+    } catch (err) {
+      console.error('Multiplexer: initial sync failed:', err)
+      throw err
+    }
+  } else {
+    console.error(`Multiplexer: resuming from persisted token: ${since}`)
+  }
+
+  while (true) {
+    try {
+      const data = await matrixSync(config, since)
+
+      const invites = parseSyncInvites(data)
+      for (const invite of invites) {
+        if (shouldAutoJoin(invite, access, config.roomIds)) {
+          matrixJoin(config, invite.roomId).catch((err) =>
+            console.error(`Failed to join ${invite.roomId}:`, err)
+          )
+        }
+      }
+
+      const events = parseSyncEvents(data)
+      for (const event of events) {
+        muxServer.broadcast(eventToFrame(event))
+      }
+      await onEvents(events)
+
+      since = data.next_batch
+      saveSyncToken(channelsDir, since)
+      backoffMs = 5000
+    } catch (err: any) {
+      const waitMs = err.retryMs ?? backoffMs
+      console.error(`Multiplexer sync error, retrying in ${waitMs}ms:`, err.message ?? err)
+      await new Promise((r) => setTimeout(r, waitMs))
+      backoffMs = Math.min(backoffMs * 2, 60000)
+    }
+  }
+}
+
+// ── Multiplexer Role Helpers ──────────────────────────
+
+async function startAsMultiplexer(
+  config: Config,
+  access: Access,
+  mcp: Server,
+  threadRootByRoom: Map<string, string>,
+  channelsDir: string,
+  lock: { release: () => void },
+): Promise<void> {
+  const muxServer = new MuxServer(channelsDir)
+  await muxServer.start()
+
+  registerCleanup(() => {
+    muxServer.stop().catch(() => {})
+    lock.release()
+  })
+
+  runMultiplexerSyncLoop(config, access, muxServer, channelsDir, (events) =>
+    processEvents(events, config, access, threadRootByRoom, mcp)
+  ).catch((err) => {
+    console.error('Fatal multiplexer sync error:', err)
+    process.exit(1)
+  })
+}
+
+async function runAsClient(
+  config: Config,
+  access: Access,
+  mcp: Server,
+  threadRootByRoom: Map<string, string>,
+  channelsDir: string,
+): Promise<never> {
+  const client = new MuxClient(channelsDir)
+
+  // Sequential event processing queue
+  let processing = Promise.resolve()
+  client.onFrame = (frame) => {
+    if (frame.type === 'heartbeat') return
+    const event = frameToEvent(frame as any)
+    processing = processing.then(() =>
+      processEvents([event], config, access, threadRootByRoom, mcp)
+    ).catch((err) => console.error('Error processing event from multiplexer:', err))
+  }
+
+  client.onDisconnect = async () => {
+    console.error('Multiplexer disconnected — attempting takeover')
+    const jitter = Math.random() * 2000
+    await new Promise((r) => setTimeout(r, jitter))
+
+    const lock = tryAcquireLock(channelsDir)
+    if (lock) {
+      console.error('Takeover: acquired lock — becoming multiplexer')
+      await startAsMultiplexer(config, access, mcp, threadRootByRoom, channelsDir, lock)
+    } else {
+      console.error('Takeover: lock not acquired — reconnecting as client')
+      try {
+        await client.connect()
+        console.error('Reconnected to new multiplexer as client')
+      } catch {
+        console.error('Failed to reconnect — falling back to direct sync')
+        runSyncLoop(config, access, mcp, threadRootByRoom).catch((err) => {
+          console.error('Fatal sync loop error:', err)
+          process.exit(1)
+        })
+      }
+    }
+  }
+
+  try {
+    await client.connect()
+    console.error('Connected to multiplexer as client')
+  } catch {
+    console.error('Failed to connect to multiplexer — falling back to direct sync')
+    runSyncLoop(config, access, mcp, threadRootByRoom).catch((err) => {
+      console.error('Fatal sync loop error:', err)
+      process.exit(1)
+    })
+  }
+
+  return new Promise(() => {})
+}
+
 // ── Main ───────────────────────────────────────────────
 
 if (import.meta.main) {
   const config = loadConfig()
   const access = loadAccess()
-
-  // Shared mutable map — populated by runSyncLoop, read by MCP reply handler
   const threadRootByRoom = new Map<string, string>()
 
-  // Clean up downloaded images on exit
-  process.on('SIGINT', () => { cleanupAllImages(); process.exit(0) })
-  process.on('SIGTERM', () => { cleanupAllImages(); process.exit(0) })
-  process.on('exit', cleanupAllImages)
+  // Consolidated cleanup — register once
+  registerCleanup(cleanupAllImages)
+  process.on('SIGINT', () => { runAllCleanup(); process.exit(0) })
+  process.on('SIGTERM', () => { runAllCleanup(); process.exit(0) })
+  process.on('exit', runAllCleanup)
 
   console.error(`Matrix channel starting for ${config.botUserId}`)
   console.error(`Homeserver: ${config.homeserverUrl}`)
@@ -873,9 +1053,23 @@ if (import.meta.main) {
 
   const mcp = createMcpServer(config, threadRootByRoom)
   await mcp.connect(new StdioServerTransport())
+  await setupThreadRoots(config, threadRootByRoom)
 
-  runSyncLoop(config, access, mcp, threadRootByRoom).catch((err) => {
-    console.error('Fatal sync loop error:', err)
-    process.exit(1)
-  })
+  // Role selection
+  if (!MuxServer.validateSocketPath(CHANNELS_DIR)) {
+    console.error('Role: DIRECT (socket path too long)')
+    runSyncLoop(config, access, mcp, threadRootByRoom).catch((err) => {
+      console.error('Fatal sync loop error:', err)
+      process.exit(1)
+    })
+  } else {
+    const lock = tryAcquireLock(CHANNELS_DIR)
+    if (lock) {
+      console.error('Role: MULTIPLEXER')
+      await startAsMultiplexer(config, access, mcp, threadRootByRoom, CHANNELS_DIR, lock)
+    } else {
+      console.error('Role: CLIENT')
+      await runAsClient(config, access, mcp, threadRootByRoom, CHANNELS_DIR)
+    }
+  }
 }
