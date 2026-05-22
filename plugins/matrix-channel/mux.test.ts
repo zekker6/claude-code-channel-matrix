@@ -2,10 +2,12 @@ import { describe, expect, test, beforeEach, afterEach } from 'bun:test'
 import { rmSync, mkdirSync, writeFileSync } from 'node:fs'
 import { createConnection } from 'node:net'
 import { join } from 'node:path'
-import type { TextEvent, ImageEvent, SyncEvent } from './server'
+import type { TextEvent, ImageEvent, SyncEvent, ReactionEvent } from './server'
 import {
   eventToFrame,
   frameToEvent,
+  reactionToFrame,
+  frameToReaction,
   serializeFrame,
   deserializeFrame,
   loadSyncToken,
@@ -16,6 +18,7 @@ import {
   SOCKET_FILE,
   type WireTextFrame,
   type WireImageFrame,
+  type WireReactionFrame,
   type WireHeartbeatFrame,
   type WireFrame,
 } from './mux'
@@ -81,6 +84,33 @@ describe('image event frame round-trip', () => {
 
     const restored = frameToEvent(imgFrame)
     expect(restored).toEqual(imageEvent)
+  })
+})
+
+const reactionEvent: ReactionEvent = {
+  roomId: '!room:example.com',
+  roomName: 'General',
+  sender: '@carol:example.com',
+  eventId: '$rx:example.com',
+  targetEventId: '$prompt:example.com',
+  emoji: '✅',
+}
+
+describe('reaction frame round-trip', () => {
+  test('serializes and deserializes back to original', () => {
+    const frame = reactionToFrame(reactionEvent)
+    expect(frame.v).toBe(1)
+    expect(frame.type).toBe('reaction')
+
+    const line = serializeFrame(frame)
+    expect(line).not.toContain('\n')
+
+    const parsed = deserializeFrame(line)
+    expect(parsed).not.toBeNull()
+    expect(parsed!.type).toBe('reaction')
+
+    const restored = frameToReaction(parsed as WireReactionFrame)
+    expect(restored).toEqual(reactionEvent)
   })
 })
 

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, openSync, closeSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { createConnection, createServer, type Socket, type Server as NetServer } from 'node:net'
-import type { TextEvent, ImageEvent, SyncEvent } from './server'
+import type { TextEvent, ImageEvent, SyncEvent, ReactionEvent } from './server'
 
 // ── Sync Token Persistence ────────────────────────────
 
@@ -95,13 +95,24 @@ export interface WireImageFrame {
   filename: string | null
 }
 
+export interface WireReactionFrame {
+  v: 1
+  type: 'reaction'
+  roomId: string
+  roomName: string
+  sender: string
+  eventId: string
+  targetEventId: string
+  emoji: string
+}
+
 export interface WireHeartbeatFrame {
   v: 1
   type: 'heartbeat'
   ts: number
 }
 
-export type WireFrame = WireTextFrame | WireImageFrame | WireHeartbeatFrame
+export type WireFrame = WireTextFrame | WireImageFrame | WireReactionFrame | WireHeartbeatFrame
 
 // ── Conversion ─────────────────────────────────────────
 
@@ -158,6 +169,30 @@ export function frameToEvent(frame: WireTextFrame | WireImageFrame): SyncEvent {
     mimeType: frame.mimeType,
     size: frame.size,
     filename: frame.filename,
+  }
+}
+
+export function reactionToFrame(reaction: ReactionEvent): WireReactionFrame {
+  return {
+    v: 1,
+    type: 'reaction',
+    roomId: reaction.roomId,
+    roomName: reaction.roomName,
+    sender: reaction.sender,
+    eventId: reaction.eventId,
+    targetEventId: reaction.targetEventId,
+    emoji: reaction.emoji,
+  }
+}
+
+export function frameToReaction(frame: WireReactionFrame): ReactionEvent {
+  return {
+    roomId: frame.roomId,
+    roomName: frame.roomName,
+    sender: frame.sender,
+    eventId: frame.eventId,
+    targetEventId: frame.targetEventId,
+    emoji: frame.emoji,
   }
 }
 

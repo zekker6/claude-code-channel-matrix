@@ -10,6 +10,7 @@ The plugin runs an MCP server that maintains a long-polling sync loop against th
 - Auto-joins rooms when invited by an allowed user
 - Optionally reacts to forwarded messages with a configurable acknowledgment emoji
 - Supports per-project threading — each Claude Code session gets its own thread in a room
+- Relays Claude Code's tool permission prompts to Matrix so you can approve or deny remotely with a reaction
 
 Claude receives messages tagged with room ID, room name, sender, and event ID, and can respond using two tools:
 
@@ -117,6 +118,33 @@ Thread roots are persisted in `~/.claude/channels/matrix/threads.json`, so the s
 If you run Claude Code sessions in different project directories simultaneously, each session creates its own thread in the anchor room. Messages in a project's thread are only forwarded to that project's session.
 
 > **Breaking change:** Previous versions allowed `MATRIX_ROOM_IDS` alongside `MATRIX_THREADS=true`. This is no longer valid — use `MATRIX_THREAD_ROOT_ROOM_ID` instead.
+
+## Permission relay
+
+When Claude Code needs approval for a tool use (Bash, Write, Edit, etc.) the local terminal dialog opens and the session pauses. With permission relay, the same prompt is mirrored to Matrix as a message you can approve from your phone or any client.
+
+No configuration is required - the relay is on as soon as Claude Code v2.1.81+ sees the plugin's `claude/channel/permission` capability.
+
+### How it works
+
+1. Claude Code sends the plugin a permission request (tool name, description, arguments preview, plus a short request ID).
+2. The plugin posts a prompt message to Matrix and pre-reacts with ✅ and ❌.
+3. Any allowlisted user reacts ✅ to allow or ❌ to deny. The first verdict wins.
+4. The local terminal dialog stays live in parallel - whichever side answers first decides; the other is dropped.
+
+The prompt is posted to:
+
+- The configured thread when threading is enabled (`MATRIX_THREAD_ROOT_ROOM_ID`)
+- Otherwise, the room of the most recent forwarded message
+- Otherwise, the first entry in `MATRIX_ROOM_IDS` (if set)
+
+If none of these are available, the request is dropped with a log line - send a message first so the plugin knows where to route the prompt.
+
+### Security
+
+Only reactions from senders in [the allowlist](#access-control) count. The plugin's own reactions are ignored. Reactions outside ✅/❌ are silently dropped, as are reactions on messages that aren't tied to an active permission request.
+
+Stale prompts (no reaction within one hour) are forgotten, so a late reaction cannot resurrect them.
 
 ## Optional configuration
 

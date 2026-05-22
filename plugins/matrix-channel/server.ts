@@ -9,9 +9,11 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+import { z } from 'zod'
 import {
   tryAcquireLock, MuxServer, MuxClient,
   eventToFrame, frameToEvent,
+  reactionToFrame, frameToReaction,
   loadSyncToken, saveSyncToken,
   type WireFrame,
 } from './mux'
@@ -174,11 +176,40 @@ export function saveThreadRoot(
   writeFileSync(filePath, JSON.stringify(Object.fromEntries(existing), null, 2))
 }
 
+// ── Permission Relay State ────────────────────────────
+
+export const PERMISSION_TTL_MS = 60 * 60 * 1000 // 1 hour
+export const ALLOW_EMOJI = '✅'
+export const DENY_EMOJI = '❌'
+
+export interface PendingPermission {
+  requestId: string
+  expiresAt: number
+}
+
+/** Maps the prompt-message eventId (the message the user reacts to) to the request_id. */
+export const pendingPermissions = new Map<string, PendingPermission>()
+
+/** Tracks the last room that produced a forwarded message — used as the default prompt room in room mode. */
+export const lastActiveRoomState: { roomId: string | null } = { roomId: null }
+
+export function expirePendingPermissions(now: number = Date.now()): void {
+  for (const [eventId, entry] of pendingPermissions) {
+    if (entry.expiresAt <= now) pendingPermissions.delete(eventId)
+  }
+}
+
+export function classifyVerdict(emoji: string): 'allow' | 'deny' | null {
+  if (emoji === ALLOW_EMOJI) return 'allow'
+  if (emoji === DENY_EMOJI) return 'deny'
+  return null
+}
+
 // ── Matrix CS API Helpers ──────────────────────────────
 
 const SYNC_FILTER = JSON.stringify({
   room: {
-    timeline: { types: ['m.room.message'], limit: 50 },
+    timeline: { types: ['m.room.message', 'm.reaction'], limit: 50 },
     state: { types: ['m.room.name', 'm.room.member'], lazy_load_members: true },
   },
   presence: { types: [] },
@@ -208,6 +239,15 @@ export interface ImageEvent extends BaseEvent {
 }
 
 export type SyncEvent = TextEvent | ImageEvent
+
+export interface ReactionEvent {
+  roomId: string
+  roomName: string
+  sender: string
+  eventId: string
+  targetEventId: string
+  emoji: string
+}
 
 export interface SyncInvite {
   roomId: string
@@ -298,6 +338,33 @@ export function parseSyncEvents(data: any): SyncEvent[] {
   }
 
   return events
+}
+
+export function parseSyncReactions(data: any): ReactionEvent[] {
+  const reactions: ReactionEvent[] = []
+  const joined = data.rooms?.join ?? {}
+
+  for (const [roomId, room] of Object.entries<any>(joined)) {
+    const roomName: string = roomNameCache.get(roomId) ?? roomId
+
+    for (const event of room.timeline?.events ?? []) {
+      if (event.type !== 'm.reaction') continue
+      const relates = event.content?.['m.relates_to']
+      if (!relates || relates.rel_type !== 'm.annotation') continue
+      if (typeof relates.event_id !== 'string' || typeof relates.key !== 'string') continue
+
+      reactions.push({
+        roomId,
+        roomName,
+        sender: event.sender,
+        eventId: event.event_id,
+        targetEventId: relates.event_id,
+        emoji: relates.key,
+      })
+    }
+  }
+
+  return reactions
 }
 
 export function parseSyncInvites(data: any): SyncInvite[] {
@@ -635,23 +702,129 @@ async function ensureThreadRoot(
   return eventId
 }
 
+// ── Permission Relay ──────────────────────────────────
+
+export interface PermissionRequestParams {
+  request_id: string
+  tool_name: string
+  description: string
+  input_preview: string
+}
+
+export function buildPermissionPromptText(params: PermissionRequestParams): string {
+  const lines = [
+    `🔐 Claude wants to use ${params.tool_name} (id: ${params.request_id})`,
+    params.description,
+  ]
+  if (params.input_preview) {
+    lines.push('', '```', params.input_preview, '```')
+  }
+  lines.push('', `React ${ALLOW_EMOJI} to allow or ${DENY_EMOJI} to deny.`)
+  return lines.join('\n')
+}
+
+export function buildPermissionPromptHtml(params: PermissionRequestParams): string {
+  const esc = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const parts = [
+    `<p>🔐 <b>Claude wants to use ${esc(params.tool_name)}</b> <code>id: ${esc(params.request_id)}</code></p>`,
+    `<p>${esc(params.description)}</p>`,
+  ]
+  if (params.input_preview) {
+    parts.push(`<pre><code>${esc(params.input_preview)}</code></pre>`)
+  }
+  parts.push(`<p>React ${ALLOW_EMOJI} to allow or ${DENY_EMOJI} to deny.</p>`)
+  return parts.join('')
+}
+
+export function pickPermissionRoom(
+  config: Config,
+  lastActive: { roomId: string | null },
+): string | null {
+  if (config.threadRootRoomId) return config.threadRootRoomId
+  if (lastActive.roomId) return lastActive.roomId
+  if (config.roomIds && config.roomIds.length > 0) return config.roomIds[0]!
+  return null
+}
+
+async function relayPermissionRequest(
+  config: Config,
+  threadRootByRoom: Map<string, string>,
+  params: PermissionRequestParams,
+): Promise<void> {
+  expirePendingPermissions()
+
+  const roomId = pickPermissionRoom(config, lastActiveRoomState)
+  if (!roomId) {
+    console.error(
+      `Permission request ${params.request_id}: no target room available — drop. ` +
+      'Send a message first or configure MATRIX_ROOM_IDS / MATRIX_THREAD_ROOT_ROOM_ID.',
+    )
+    return
+  }
+
+  const threadRootId = threadRootByRoom.get(roomId)
+  const text = buildPermissionPromptText(params)
+  const html = buildPermissionPromptHtml(params)
+
+  const eventId = await matrixReply(config, roomId, text, html, threadRootId)
+
+  pendingPermissions.set(eventId, {
+    requestId: params.request_id,
+    expiresAt: Date.now() + PERMISSION_TTL_MS,
+  })
+
+  console.error(
+    `Permission request ${params.request_id} relayed to ${roomId} as ${eventId} (tool=${params.tool_name})`,
+  )
+
+  // Pre-react so the user can one-tap. Fire-and-forget; failure is non-fatal.
+  matrixReact(config, roomId, eventId, ALLOW_EMOJI).catch((err) =>
+    console.error(`Pre-react ${ALLOW_EMOJI} failed:`, err),
+  )
+  matrixReact(config, roomId, eventId, DENY_EMOJI).catch((err) =>
+    console.error(`Pre-react ${DENY_EMOJI} failed:`, err),
+  )
+}
+
 // ── MCP Server ─────────────────────────────────────────
 
 function createMcpServer(config: Config, threadRootByRoom: Map<string, string>): Server {
   const mcp = new Server(
-    { name: 'matrix', version: '0.5.0' },
+    { name: 'matrix', version: '0.6.0' },
     {
       capabilities: {
-        experimental: { 'claude/channel': {} },
+        experimental: {
+          'claude/channel': {},
+          'claude/channel/permission': {},
+        },
         tools: {},
       },
       instructions:
         'Messages arrive as <channel source="matrix" room_id="!abc:domain" room_name="General" sender="@user:domain" event_id="$evt:domain">. ' +
         'Reply with the reply tool (pass room_id). React with the react tool (pass room_id, event_id, emoji). ' +
         'When a message contains an image file path, use the Read tool to view it before responding. ' +
-        'Threading is handled automatically — replies are routed to the correct thread.',
+        'Threading is handled automatically - replies are routed to the correct thread.',
     },
   )
+
+  const PermissionRequestSchema = z.object({
+    method: z.literal('notifications/claude/channel/permission_request'),
+    params: z.object({
+      request_id: z.string(),
+      tool_name: z.string(),
+      description: z.string(),
+      input_preview: z.string(),
+    }),
+  })
+
+  mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
+    try {
+      await relayPermissionRequest(config, threadRootByRoom, params)
+    } catch (err) {
+      console.error('Failed to relay permission request:', err)
+    }
+  })
 
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
@@ -796,6 +969,8 @@ export async function processEvents(
       }
     }
 
+    lastActiveRoomState.roomId = event.roomId
+
     await mcp.notification({
       method: 'notifications/claude/channel',
       params: { content, meta },
@@ -810,6 +985,48 @@ export async function processEvents(
         console.error(`Ack reaction failed for ${event.eventId}:`, err)
       )
     }
+  }
+}
+
+export function shouldHonorReaction(
+  reaction: ReactionEvent,
+  access: Access,
+  botUserId: string,
+  roomIds: string[] | null = null,
+): boolean {
+  if (reaction.sender === botUserId) return false
+  if (!access.allowedUsers.includes(reaction.sender)) return false
+  if (roomIds && !roomIds.includes(reaction.roomId)) return false
+  return true
+}
+
+export async function processReactions(
+  reactions: ReactionEvent[],
+  config: Config,
+  access: Access,
+  mcp: Server,
+): Promise<void> {
+  expirePendingPermissions()
+
+  for (const reaction of reactions) {
+    if (!shouldHonorReaction(reaction, access, config.botUserId, config.roomIds)) continue
+
+    const entry = pendingPermissions.get(reaction.targetEventId)
+    if (!entry) continue
+
+    const behavior = classifyVerdict(reaction.emoji)
+    if (!behavior) continue
+
+    pendingPermissions.delete(reaction.targetEventId)
+
+    console.error(
+      `Permission ${entry.requestId}: ${behavior} (by ${reaction.sender} via ${reaction.emoji})`,
+    )
+
+    await mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: { request_id: entry.requestId, behavior },
+    })
   }
 }
 
@@ -868,6 +1085,10 @@ async function runSyncLoop(
       const events = parseSyncEvents(data)
       await processEvents(events, config, access, threadRootByRoom, mcp)
 
+      // Process reactions (used for permission relay verdicts)
+      const reactions = parseSyncReactions(data)
+      await processReactions(reactions, config, access, mcp)
+
       since = data.next_batch
       backoffMs = 5000 // reset on success
     } catch (err: any) {
@@ -887,6 +1108,7 @@ async function runMultiplexerSyncLoop(
   muxServer: MuxServer,
   channelsDir: string,
   onEvents: (events: SyncEvent[]) => Promise<void>,
+  onReactions: (reactions: ReactionEvent[]) => Promise<void>,
 ): Promise<never> {
   let since = loadSyncToken(channelsDir)
   let backoffMs = 5000
@@ -935,6 +1157,12 @@ async function runMultiplexerSyncLoop(
       }
       await onEvents(events)
 
+      const reactions = parseSyncReactions(data)
+      for (const reaction of reactions) {
+        muxServer.broadcast(reactionToFrame(reaction))
+      }
+      await onReactions(reactions)
+
       since = data.next_batch
       saveSyncToken(channelsDir, since)
       backoffMs = 5000
@@ -965,8 +1193,13 @@ async function startAsMultiplexer(
     lock.release()
   })
 
-  runMultiplexerSyncLoop(config, access, muxServer, channelsDir, (events) =>
-    processEvents(events, config, access, threadRootByRoom, mcp)
+  runMultiplexerSyncLoop(
+    config,
+    access,
+    muxServer,
+    channelsDir,
+    (events) => processEvents(events, config, access, threadRootByRoom, mcp),
+    (reactions) => processReactions(reactions, config, access, mcp),
   ).catch((err) => {
     console.error('Fatal multiplexer sync error:', err)
     process.exit(1)
@@ -986,7 +1219,14 @@ async function runAsClient(
   let processing = Promise.resolve()
   client.onFrame = (frame) => {
     if (frame.type === 'heartbeat') return
-    const event = frameToEvent(frame as any)
+    if (frame.type === 'reaction') {
+      const reaction = frameToReaction(frame)
+      processing = processing.then(() =>
+        processReactions([reaction], config, access, mcp)
+      ).catch((err) => console.error('Error processing reaction from multiplexer:', err))
+      return
+    }
+    const event = frameToEvent(frame)
     processing = processing.then(() =>
       processEvents([event], config, access, threadRootByRoom, mcp)
     ).catch((err) => console.error('Error processing event from multiplexer:', err))

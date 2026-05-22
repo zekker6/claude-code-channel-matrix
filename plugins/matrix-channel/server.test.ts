@@ -3,6 +3,20 @@ import { loadConfig, loadAccess, DEFAULT_MAX_IMAGE_SIZE, type Config, type Acces
 import { shouldForwardEvent, shouldAutoJoin, type SyncEvent, type SyncInvite, type TextEvent, type ImageEvent } from './server'
 import { downloadImage, scheduleImageCleanup, cleanupAllImages, trackedImages } from './server'
 import { loadThreadRoots, saveThreadRoot } from './server'
+import {
+  parseSyncReactions,
+  shouldHonorReaction,
+  classifyVerdict,
+  pickPermissionRoom,
+  buildPermissionPromptText,
+  expirePendingPermissions,
+  processReactions,
+  pendingPermissions,
+  lastActiveRoomState,
+  ALLOW_EMOJI,
+  DENY_EMOJI,
+  type ReactionEvent,
+} from './server'
 import { existsSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
 
 describe('loadConfig', () => {
@@ -1192,5 +1206,298 @@ describe('cleanupAllImages', () => {
     trackedImages.add('/tmp/nonexistent-image.png')
     cleanupAllImages()
     expect(trackedImages.size).toBe(0)
+  })
+})
+
+// ── Permission Relay ──────────────────────────────────
+
+const PROMPT_EVENT = '$prompt-evt:x'
+const REQUEST_ID = 'abcde'
+const BOT = '@bot:x'
+
+function makeReaction(overrides: Partial<ReactionEvent> = {}): ReactionEvent {
+  return {
+    roomId: '!r:x',
+    roomName: 'r',
+    sender: '@alice:x',
+    eventId: '$reaction-evt:x',
+    targetEventId: PROMPT_EVENT,
+    emoji: ALLOW_EMOJI,
+    ...overrides,
+  }
+}
+
+const baseConfig: Config = {
+  homeserverUrl: 'https://x',
+  accessToken: 't',
+  botUserId: BOT,
+  roomIds: null,
+  threadProject: null,
+  threadRootRoomId: null,
+}
+
+const baseAccess: Access = {
+  allowedUsers: ['@alice:x'],
+  ackReaction: null,
+  maxImageSize: DEFAULT_MAX_IMAGE_SIZE,
+}
+
+interface RecordedNotification {
+  method: string
+  params: any
+}
+
+function mockMcp(): { mcp: any; calls: RecordedNotification[] } {
+  const calls: RecordedNotification[] = []
+  return {
+    calls,
+    mcp: { notification: async (n: RecordedNotification) => { calls.push(n) } },
+  }
+}
+
+describe('classifyVerdict', () => {
+  test('allow on ✅', () => { expect(classifyVerdict(ALLOW_EMOJI)).toBe('allow') })
+  test('deny on ❌', () => { expect(classifyVerdict(DENY_EMOJI)).toBe('deny') })
+  test('null on anything else', () => {
+    expect(classifyVerdict('👍')).toBeNull()
+    expect(classifyVerdict('👎')).toBeNull()
+    expect(classifyVerdict('🎉')).toBeNull()
+    expect(classifyVerdict('')).toBeNull()
+  })
+})
+
+describe('parseSyncReactions', () => {
+  test('extracts annotation reactions with sender, key, target', () => {
+    const data = {
+      rooms: {
+        join: {
+          '!r:x': {
+            timeline: {
+              events: [{
+                type: 'm.reaction',
+                sender: '@alice:x',
+                event_id: '$rx',
+                content: { 'm.relates_to': { rel_type: 'm.annotation', event_id: PROMPT_EVENT, key: ALLOW_EMOJI } },
+              }],
+            },
+          },
+        },
+      },
+    }
+    const reactions = parseSyncReactions(data)
+    expect(reactions).toHaveLength(1)
+    expect(reactions[0]).toMatchObject({
+      roomId: '!r:x',
+      sender: '@alice:x',
+      eventId: '$rx',
+      targetEventId: PROMPT_EVENT,
+      emoji: ALLOW_EMOJI,
+    })
+  })
+
+  test('skips non-annotation rel_types', () => {
+    const data = {
+      rooms: {
+        join: {
+          '!r:x': {
+            timeline: {
+              events: [{
+                type: 'm.reaction',
+                sender: '@a:x',
+                event_id: '$rx',
+                content: { 'm.relates_to': { rel_type: 'm.replace', event_id: PROMPT_EVENT, key: ALLOW_EMOJI } },
+              }],
+            },
+          },
+        },
+      },
+    }
+    expect(parseSyncReactions(data)).toHaveLength(0)
+  })
+
+  test('skips reactions missing m.relates_to', () => {
+    const data = {
+      rooms: {
+        join: {
+          '!r:x': {
+            timeline: {
+              events: [{ type: 'm.reaction', sender: '@a:x', event_id: '$rx', content: {} }],
+            },
+          },
+        },
+      },
+    }
+    expect(parseSyncReactions(data)).toHaveLength(0)
+  })
+
+  test('ignores non-reaction events', () => {
+    const data = {
+      rooms: {
+        join: {
+          '!r:x': {
+            timeline: {
+              events: [{ type: 'm.room.message', sender: '@a:x', event_id: '$m', content: { msgtype: 'm.text', body: 'hi' } }],
+            },
+          },
+        },
+      },
+    }
+    expect(parseSyncReactions(data)).toHaveLength(0)
+  })
+})
+
+describe('shouldHonorReaction', () => {
+  test('rejects bot reactions', () => {
+    expect(shouldHonorReaction(makeReaction({ sender: BOT }), baseAccess, BOT)).toBe(false)
+  })
+  test('rejects senders not in allowlist', () => {
+    expect(shouldHonorReaction(makeReaction({ sender: '@stranger:x' }), baseAccess, BOT)).toBe(false)
+  })
+  test('accepts allowlisted senders', () => {
+    expect(shouldHonorReaction(makeReaction({ sender: '@alice:x' }), baseAccess, BOT)).toBe(true)
+  })
+  test('rejects when room is not in roomIds filter', () => {
+    expect(shouldHonorReaction(makeReaction({ roomId: '!other:x' }), baseAccess, BOT, ['!r:x'])).toBe(false)
+  })
+  test('accepts when room is in roomIds filter', () => {
+    expect(shouldHonorReaction(makeReaction({ roomId: '!r:x' }), baseAccess, BOT, ['!r:x'])).toBe(true)
+  })
+})
+
+describe('pickPermissionRoom', () => {
+  test('returns thread root in thread mode', () => {
+    const cfg: Config = { ...baseConfig, threadRootRoomId: '!thread:x', threadProject: 'p' }
+    expect(pickPermissionRoom(cfg, { roomId: '!ignored:x' })).toBe('!thread:x')
+  })
+  test('falls back to last active room in room mode', () => {
+    expect(pickPermissionRoom(baseConfig, { roomId: '!last:x' })).toBe('!last:x')
+  })
+  test('falls back to first configured room when no last active', () => {
+    const cfg: Config = { ...baseConfig, roomIds: ['!first:x', '!second:x'] }
+    expect(pickPermissionRoom(cfg, { roomId: null })).toBe('!first:x')
+  })
+  test('returns null when no info', () => {
+    expect(pickPermissionRoom(baseConfig, { roomId: null })).toBeNull()
+  })
+})
+
+describe('buildPermissionPromptText', () => {
+  test('includes request id, tool, description, preview, instruction', () => {
+    const text = buildPermissionPromptText({
+      request_id: REQUEST_ID,
+      tool_name: 'Bash',
+      description: 'list files',
+      input_preview: 'ls -la',
+    })
+    expect(text).toContain(REQUEST_ID)
+    expect(text).toContain('Bash')
+    expect(text).toContain('list files')
+    expect(text).toContain('ls -la')
+    expect(text).toContain(ALLOW_EMOJI)
+    expect(text).toContain(DENY_EMOJI)
+  })
+
+  test('omits preview block when input_preview is empty', () => {
+    const text = buildPermissionPromptText({
+      request_id: REQUEST_ID,
+      tool_name: 'Bash',
+      description: 'd',
+      input_preview: '',
+    })
+    expect(text).not.toContain('```')
+  })
+})
+
+describe('expirePendingPermissions', () => {
+  beforeEach(() => { pendingPermissions.clear() })
+  afterEach(() => { pendingPermissions.clear() })
+
+  test('removes entries past expiresAt', () => {
+    pendingPermissions.set('$old', { requestId: 'old1a', expiresAt: 100 })
+    pendingPermissions.set('$new', { requestId: 'new1a', expiresAt: 10_000 })
+    expirePendingPermissions(500)
+    expect(pendingPermissions.has('$old')).toBe(false)
+    expect(pendingPermissions.has('$new')).toBe(true)
+  })
+})
+
+describe('processReactions', () => {
+  beforeEach(() => {
+    pendingPermissions.clear()
+    lastActiveRoomState.roomId = null
+  })
+  afterEach(() => {
+    pendingPermissions.clear()
+    lastActiveRoomState.roomId = null
+  })
+
+  test('emits allow verdict when allowed user reacts ✅', async () => {
+    pendingPermissions.set(PROMPT_EVENT, { requestId: REQUEST_ID, expiresAt: Date.now() + 60000 })
+    const { mcp, calls } = mockMcp()
+    await processReactions([makeReaction()], baseConfig, baseAccess, mcp)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toEqual({
+      method: 'notifications/claude/channel/permission',
+      params: { request_id: REQUEST_ID, behavior: 'allow' },
+    })
+    expect(pendingPermissions.has(PROMPT_EVENT)).toBe(false)
+  })
+
+  test('emits deny verdict on ❌', async () => {
+    pendingPermissions.set(PROMPT_EVENT, { requestId: REQUEST_ID, expiresAt: Date.now() + 60000 })
+    const { mcp, calls } = mockMcp()
+    await processReactions([makeReaction({ emoji: DENY_EMOJI })], baseConfig, baseAccess, mcp)
+    expect(calls[0]?.params).toEqual({ request_id: REQUEST_ID, behavior: 'deny' })
+  })
+
+  test('ignores reactions on unknown targets', async () => {
+    const { mcp, calls } = mockMcp()
+    await processReactions([makeReaction({ targetEventId: '$unknown' })], baseConfig, baseAccess, mcp)
+    expect(calls).toHaveLength(0)
+  })
+
+  test('ignores reactions from bot itself', async () => {
+    pendingPermissions.set(PROMPT_EVENT, { requestId: REQUEST_ID, expiresAt: Date.now() + 60000 })
+    const { mcp, calls } = mockMcp()
+    await processReactions([makeReaction({ sender: BOT })], baseConfig, baseAccess, mcp)
+    expect(calls).toHaveLength(0)
+    expect(pendingPermissions.has(PROMPT_EVENT)).toBe(true)
+  })
+
+  test('ignores reactions from non-allowlisted users', async () => {
+    pendingPermissions.set(PROMPT_EVENT, { requestId: REQUEST_ID, expiresAt: Date.now() + 60000 })
+    const { mcp, calls } = mockMcp()
+    await processReactions([makeReaction({ sender: '@stranger:x' })], baseConfig, baseAccess, mcp)
+    expect(calls).toHaveLength(0)
+    expect(pendingPermissions.has(PROMPT_EVENT)).toBe(true)
+  })
+
+  test('ignores unsupported emojis but keeps entry pending', async () => {
+    pendingPermissions.set(PROMPT_EVENT, { requestId: REQUEST_ID, expiresAt: Date.now() + 60000 })
+    const { mcp, calls } = mockMcp()
+    await processReactions([makeReaction({ emoji: '👍' })], baseConfig, baseAccess, mcp)
+    expect(calls).toHaveLength(0)
+    expect(pendingPermissions.has(PROMPT_EVENT)).toBe(true)
+  })
+
+  test('expires stale entries before processing', async () => {
+    pendingPermissions.set(PROMPT_EVENT, { requestId: REQUEST_ID, expiresAt: Date.now() - 1 })
+    const { mcp, calls } = mockMcp()
+    await processReactions([makeReaction()], baseConfig, baseAccess, mcp)
+    expect(calls).toHaveLength(0)
+    expect(pendingPermissions.has(PROMPT_EVENT)).toBe(false)
+  })
+
+  test('first matching reaction wins; subsequent ones drop', async () => {
+    pendingPermissions.set(PROMPT_EVENT, { requestId: REQUEST_ID, expiresAt: Date.now() + 60000 })
+    const { mcp, calls } = mockMcp()
+    await processReactions(
+      [makeReaction({ emoji: ALLOW_EMOJI }), makeReaction({ emoji: DENY_EMOJI, eventId: '$rx2' })],
+      baseConfig,
+      baseAccess,
+      mcp,
+    )
+    expect(calls).toHaveLength(1)
+    expect(calls[0]?.params.behavior).toBe('allow')
   })
 })
