@@ -8,18 +8,16 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: plugins/matrix-channel
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: jdx/mise-action@v2
         with:
-          bun-version: latest
+          install: true
+          cache: true
 
       - name: Install dependencies
-        run: bun install --frozen-lockfile
+        run: task install
 
       - name: Run tests
-        run: bun test
+        run: task test

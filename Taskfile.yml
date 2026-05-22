@@ -1,0 +1,35 @@
+version: "3"
+
+vars:
+  PLUGIN_DIR: plugins/matrix-channel
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  install:
+    desc: Install dependencies (frozen lockfile)
+    dir: "{{.PLUGIN_DIR}}"
+    cmds:
+      - bun install --frozen-lockfile
+
+  install:update:
+    desc: Install and update lockfile
+    dir: "{{.PLUGIN_DIR}}"
+    cmds:
+      - bun install
+
+  test:
+    desc: Run the test suite
+    dir: "{{.PLUGIN_DIR}}"
+    cmds:
+      - bun test
+
+  test:watch:
+    desc: Run the test suite in watch mode
+    dir: "{{.PLUGIN_DIR}}"
+    cmds:
+      - bun test --watch
