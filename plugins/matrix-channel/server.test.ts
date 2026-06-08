@@ -1501,3 +1501,215 @@ describe('processReactions', () => {
     expect(calls[0]?.params.behavior).toBe('allow')
   })
 })
+
+// ── Typing Coordinator ────────────────────────────────
+
+import {
+  TypingCoordinator,
+  LocalTypingController,
+  ClientTypingController,
+  type SendTyping,
+} from './server'
+import type { WireFrame } from './mux'
+
+function typingRecorder(): { send: SendTyping; calls: Array<{ roomId: string; typing: boolean }> } {
+  const calls: Array<{ roomId: string; typing: boolean }> = []
+  return { calls, send: async (roomId, typing) => { calls.push({ roomId, typing }) } }
+}
+
+// Long-lived timers so they never fire during a single synchronous test.
+const inert = { refreshMs: 60_000, maxMs: 60_000 }
+
+describe('TypingCoordinator', () => {
+  test('first lease drives typing:true, last release drives typing:false', () => {
+    const { send, calls } = typingRecorder()
+    const c = new TypingCoordinator(send, inert)
+    c.acquire('local', '!r:x')
+    expect(calls).toEqual([{ roomId: '!r:x', typing: true }])
+    expect(c.isTyping('!r:x')).toBe(true)
+    c.release('local', '!r:x')
+    expect(calls).toEqual([
+      { roomId: '!r:x', typing: true },
+      { roomId: '!r:x', typing: false },
+    ])
+    expect(c.isTyping('!r:x')).toBe(false)
+  })
+
+  test('one holder releasing does not clear another holder still in the room', () => {
+    // Codex Finding 1: concurrent sessions sharing a room must not stop each other's indicator.
+    const { send, calls } = typingRecorder()
+    const c = new TypingCoordinator(send, inert)
+    c.acquire('sessionA', '!shared:x')
+    c.acquire('sessionB', '!shared:x')
+    // Only one typing:true for the room despite two holders.
+    expect(calls).toEqual([{ roomId: '!shared:x', typing: true }])
+
+    c.release('sessionA', '!shared:x') // A replied first; B is still working
+    expect(c.isTyping('!shared:x')).toBe(true)
+    expect(calls.filter((x) => !x.typing)).toHaveLength(0) // no typing:false yet
+
+    c.release('sessionB', '!shared:x') // now the last holder leaves
+    expect(c.isTyping('!shared:x')).toBe(false)
+    expect(calls).toContainEqual({ roomId: '!shared:x', typing: false })
+  })
+
+  test('acquire is idempotent per (holder, room)', () => {
+    const { send, calls } = typingRecorder()
+    const c = new TypingCoordinator(send, inert)
+    c.acquire('local', '!r:x')
+    c.acquire('local', '!r:x')
+    c.acquire('local', '!r:x')
+    expect(calls.filter((x) => x.typing)).toHaveLength(1)
+    c.stopAll()
+  })
+
+  test('release is a no-op when the holder has no lease', () => {
+    const { send, calls } = typingRecorder()
+    const c = new TypingCoordinator(send, inert)
+    c.release('ghost', '!r:x')
+    expect(calls).toHaveLength(0)
+  })
+
+  test('releaseAll drops only that holder, leaving rooms others still hold', () => {
+    const { send } = typingRecorder()
+    const c = new TypingCoordinator(send, inert)
+    c.acquire('A', '!one:x')
+    c.acquire('A', '!two:x')
+    c.acquire('B', '!one:x')
+
+    c.releaseAll('A')
+    expect(c.isTyping('!one:x')).toBe(true)  // B still holds !one
+    expect(c.isTyping('!two:x')).toBe(false) // only A held !two
+    c.stopAll()
+  })
+
+  test('rooms are tracked independently', () => {
+    const { send } = typingRecorder()
+    const c = new TypingCoordinator(send, inert)
+    c.acquire('local', '!a:x')
+    c.acquire('local', '!b:x')
+    c.release('local', '!a:x')
+    expect(c.isTyping('!a:x')).toBe(false)
+    expect(c.isTyping('!b:x')).toBe(true)
+    c.stopAll()
+  })
+
+  test('stopAll clears every room and emits typing:false for active ones', () => {
+    const { send, calls } = typingRecorder()
+    const c = new TypingCoordinator(send, inert)
+    c.acquire('local', '!a:x')
+    c.acquire('local', '!b:x')
+    c.stopAll()
+    expect(c.isTyping('!a:x')).toBe(false)
+    expect(c.isTyping('!b:x')).toBe(false)
+    expect(calls.filter((x) => !x.typing).map((x) => x.roomId).sort()).toEqual(['!a:x', '!b:x'])
+  })
+
+  test('refresh timer re-asserts typing while a room is held', async () => {
+    const { send, calls } = typingRecorder()
+    const c = new TypingCoordinator(send, { refreshMs: 20, maxMs: 60_000 })
+    c.acquire('local', '!r:x')
+    await new Promise((r) => setTimeout(r, 70))
+    c.stopAll()
+    expect(calls.filter((x) => x.typing).length).toBeGreaterThanOrEqual(3)
+  })
+
+  test('per-lease safety timeout releases a stuck lease', async () => {
+    const { send, calls } = typingRecorder()
+    const c = new TypingCoordinator(send, { refreshMs: 60_000, maxMs: 30 })
+    c.acquire('local', '!r:x')
+    await new Promise((r) => setTimeout(r, 60))
+    expect(c.isTyping('!r:x')).toBe(false)
+    expect(calls).toContainEqual({ roomId: '!r:x', typing: false })
+  })
+
+  test('re-acquire pushes the safety deadline out instead of stacking', async () => {
+    const { send } = typingRecorder()
+    const c = new TypingCoordinator(send, { refreshMs: 60_000, maxMs: 40 })
+    c.acquire('local', '!r:x')
+    await new Promise((r) => setTimeout(r, 25))
+    c.acquire('local', '!r:x') // renews the lease for another 40ms
+    await new Promise((r) => setTimeout(r, 25)) // 50ms in, original deadline passed but renewed
+    expect(c.isTyping('!r:x')).toBe(true)
+    await new Promise((r) => setTimeout(r, 30)) // past the renewed deadline
+    expect(c.isTyping('!r:x')).toBe(false)
+  })
+})
+
+describe('LocalTypingController', () => {
+  test('start/stop drive the coordinator under a single holder and track active rooms', () => {
+    const { send, calls } = typingRecorder()
+    const c = new TypingCoordinator(send, inert)
+    const ctrl = new LocalTypingController(c)
+    ctrl.start('!r:x')
+    expect(ctrl.activeRooms()).toEqual(['!r:x'])
+    expect(c.isTyping('!r:x')).toBe(true)
+    ctrl.stop('!r:x')
+    expect(ctrl.activeRooms()).toEqual([])
+    expect(calls).toEqual([
+      { roomId: '!r:x', typing: true },
+      { roomId: '!r:x', typing: false },
+    ])
+  })
+
+  test('two controllers on one coordinator refcount the same room', () => {
+    const { send, calls } = typingRecorder()
+    const c = new TypingCoordinator(send, inert)
+    const owner = new LocalTypingController(c, 'local')
+    const client = new LocalTypingController(c, 'c0')
+    owner.start('!shared:x')
+    client.start('!shared:x')
+    owner.stop('!shared:x')
+    expect(c.isTyping('!shared:x')).toBe(true) // client still holds it
+    client.stop('!shared:x')
+    expect(c.isTyping('!shared:x')).toBe(false)
+    expect(calls.filter((x) => x.typing)).toHaveLength(1)
+    expect(calls.filter((x) => !x.typing)).toHaveLength(1)
+  })
+
+  test('resync re-acquires all held rooms', () => {
+    const { send } = typingRecorder()
+    const c = new TypingCoordinator(send, inert)
+    const ctrl = new LocalTypingController(c)
+    ctrl.start('!a:x')
+    ctrl.start('!b:x')
+    c.stopAll() // simulate the coordinator being replaced under the controller
+    expect(c.isTyping('!a:x')).toBe(false)
+    ctrl.resync()
+    expect(c.isTyping('!a:x')).toBe(true)
+    expect(c.isTyping('!b:x')).toBe(true)
+    c.stopAll()
+  })
+})
+
+describe('ClientTypingController', () => {
+  function linkRecorder(): { link: { send: (f: WireFrame) => void }; frames: WireFrame[] } {
+    const frames: WireFrame[] = []
+    return { frames, link: { send: (f) => frames.push(f) } }
+  }
+
+  test('start and stop emit typing lease frames', () => {
+    const { link, frames } = linkRecorder()
+    const ctrl = new ClientTypingController(link)
+    ctrl.start('!r:x')
+    ctrl.stop('!r:x')
+    expect(frames).toEqual([
+      { v: 1, type: 'typing', roomId: '!r:x', active: true },
+      { v: 1, type: 'typing', roomId: '!r:x', active: false },
+    ])
+    expect(ctrl.activeRooms()).toEqual([])
+  })
+
+  test('resync re-sends an active lease for every held room', () => {
+    const { link, frames } = linkRecorder()
+    const ctrl = new ClientTypingController(link)
+    ctrl.start('!a:x')
+    ctrl.start('!b:x')
+    frames.length = 0 // ignore the initial acquires
+    ctrl.resync()
+    expect(frames).toEqual([
+      { v: 1, type: 'typing', roomId: '!a:x', active: true },
+      { v: 1, type: 'typing', roomId: '!b:x', active: true },
+    ])
+  })
+})

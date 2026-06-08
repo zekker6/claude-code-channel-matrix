@@ -11,6 +11,7 @@ The plugin runs an MCP server that maintains a long-polling sync loop against th
 - Optionally reacts to forwarded messages with a configurable acknowledgment emoji
 - Supports per-project threading — each Claude Code session gets its own thread in a room
 - Relays Claude Code's tool permission prompts to Matrix so you can approve or deny remotely with a reaction
+- Shows a "typing" indicator in the room while Claude works on a message, so longer turns visibly signal progress
 
 Claude receives messages tagged with room ID, room name, sender, and event ID, and can respond using two tools:
 
@@ -145,6 +146,18 @@ If none of these are available, the request is dropped with a log line - send a 
 Only reactions from senders in [the allowlist](#access-control) count. The plugin's own reactions are ignored. Reactions outside ✅/❌ are silently dropped, as are reactions on messages that aren't tied to an active permission request.
 
 Stale prompts (no reaction within one hour) are forgotten, so a late reaction cannot resurrect them.
+
+## Typing indicator
+
+When a message is forwarded to Claude, the bot starts a Matrix typing notification in that room and keeps it alive until Claude replies. This gives you the standard "Claude is typing..." cue in Element (or any Matrix client) for the whole duration of a turn, so long-running tasks no longer look idle while Claude reads files, runs commands, and thinks.
+
+The indicator clears as soon as Claude's reply is sent, and also on a failed reply attempt so it can never get stuck on. As a backstop, each working session's lease expires after 10 minutes if its turn never produces a reply, and Matrix expires the notification automatically after 30 seconds without a refresh.
+
+When multiple Claude Code sessions share a room (several mux clients, or multiple projects threaded into one anchor room), typing is reference-counted across them by the multiplexer owner. The indicator turns on when the first session starts working and turns off only when the last one finishes, so one session replying never clears another session's still-running turn.
+
+No configuration is required and the behavior is always on.
+
+> **Scope:** this surfaces *that* Claude is working, not *what* it is doing. The channel protocol does not expose tool calls or reasoning to the plugin, so per-tool progress and reasoning narration are out of scope for this indicator.
 
 ## Optional configuration
 

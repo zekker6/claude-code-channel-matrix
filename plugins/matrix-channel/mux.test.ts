@@ -331,6 +331,68 @@ describe('MuxClient', () => {
   })
 })
 
+describe('upstream typing frames', () => {
+  const tmpDir = '/tmp/mux-test-upstream'
+
+  beforeEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+    mkdirSync(tmpDir, { recursive: true })
+  })
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  test('server receives typing lease frames a client sends, tagged by connection id', async () => {
+    const server = new MuxServer(tmpDir)
+    const received: Array<{ connId: string; frame: WireFrame }> = []
+    server.onClientFrame = (connId, frame) => received.push({ connId, frame })
+    await server.start()
+
+    const client = new MuxClient(tmpDir)
+    await client.connect()
+    client.send({ v: 1, type: 'typing', roomId: '!r:x', active: true })
+    client.send({ v: 1, type: 'typing', roomId: '!r:x', active: false })
+
+    await new Promise((r) => setTimeout(r, 50))
+    expect(received).toHaveLength(2)
+    expect(received[0].frame).toEqual({ v: 1, type: 'typing', roomId: '!r:x', active: true })
+    expect(received[1].frame).toEqual({ v: 1, type: 'typing', roomId: '!r:x', active: false })
+    // Both frames arrive on the same connection id, so leases can be refcounted per client.
+    expect(received[0].connId).toBe(received[1].connId)
+
+    client.disconnect()
+    await server.stop()
+  })
+
+  test('server fires onClientClose with the connection id when a client drops', async () => {
+    const server = new MuxServer(tmpDir)
+    let closedConnId: string | null = null
+    let openedConnId: string | null = null
+    server.onClientFrame = (connId) => { openedConnId = connId }
+    server.onClientClose = (connId) => { closedConnId = connId }
+    await server.start()
+
+    const client = new MuxClient(tmpDir)
+    await client.connect()
+    client.send({ v: 1, type: 'typing', roomId: '!r:x', active: true })
+    await new Promise((r) => setTimeout(r, 30))
+    client.disconnect()
+
+    await new Promise((r) => setTimeout(r, 50))
+    expect(closedConnId).not.toBeNull()
+    expect(closedConnId).toBe(openedConnId)
+
+    await server.stop()
+  })
+
+  test('send is a no-op when the client is not connected', () => {
+    const client = new MuxClient(tmpDir)
+    // Should not throw even though there is no socket.
+    expect(() => client.send({ v: 1, type: 'typing', roomId: '!r:x', active: true })).not.toThrow()
+  })
+})
+
 describe('multiplexer lifecycle', () => {
   const tmpDir = '/tmp/mux-test-lifecycle'
 

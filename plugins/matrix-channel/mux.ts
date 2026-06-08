@@ -112,7 +112,24 @@ export interface WireHeartbeatFrame {
   ts: number
 }
 
-export type WireFrame = WireTextFrame | WireImageFrame | WireReactionFrame | WireHeartbeatFrame
+/**
+ * Client -> multiplexer typing lease. The multiplexer owns the single shared bot identity, so it
+ * refcounts these per room and only drives the Matrix typing notification on/off at the 0<->1 edges.
+ * active=true acquires a lease, active=false releases it.
+ */
+export interface WireTypingFrame {
+  v: 1
+  type: 'typing'
+  roomId: string
+  active: boolean
+}
+
+export type WireFrame =
+  | WireTextFrame
+  | WireImageFrame
+  | WireReactionFrame
+  | WireHeartbeatFrame
+  | WireTypingFrame
 
 // ── Conversion ─────────────────────────────────────────
 
@@ -221,6 +238,12 @@ export class MuxServer {
   private server: NetServer | null = null
   private clients = new Set<Socket>()
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  private connSeq = 0
+
+  /** Called for each frame a client sends upstream (e.g. typing leases). */
+  onClientFrame: ((connId: string, frame: WireFrame) => void) | null = null
+  /** Called once when a client connection closes, so its leases can be released. */
+  onClientClose: ((connId: string) => void) | null = null
 
   constructor(channelsDir: string) {
     this.channelsDir = channelsDir
@@ -245,9 +268,30 @@ export class MuxServer {
     try { unlinkSync(this.socketPath) } catch {}
 
     this.server = createServer((socket) => {
+      const connId = `c${this.connSeq++}`
       this.clients.add(socket)
-      socket.on('close', () => this.clients.delete(socket))
-      socket.on('error', () => this.clients.delete(socket))
+
+      let buffer = ''
+      let closed = false
+      const cleanup = () => {
+        if (closed) return
+        closed = true
+        this.clients.delete(socket)
+        this.onClientClose?.(connId)
+      }
+
+      socket.on('data', (chunk) => {
+        buffer += chunk.toString()
+        const lines = buffer.split('\n')
+        buffer = lines.pop()!
+        for (const line of lines) {
+          if (!line) continue
+          const frame = deserializeFrame(line)
+          if (frame && this.onClientFrame) this.onClientFrame(connId, frame)
+        }
+      })
+      socket.on('close', cleanup)
+      socket.on('error', cleanup)
     })
 
     await new Promise<void>((resolve, reject) => {
@@ -322,6 +366,16 @@ export class MuxClient {
 
   get socketPath(): string {
     return join(this.channelsDir, SOCKET_FILE)
+  }
+
+  /** Send a frame upstream to the multiplexer (e.g. a typing lease). No-op when disconnected. */
+  send(frame: WireFrame): void {
+    if (!this.socket) return
+    try {
+      this.socket.write(serializeFrame(frame) + '\n')
+    } catch {
+      // best effort; a dropped lease self-heals on the next acquire or reconnect resync
+    }
   }
 
   async connect(): Promise<void> {
